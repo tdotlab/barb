@@ -5,8 +5,10 @@ commands in your working directory, asking before it changes anything. It is bui
 RingTail's programs are: a core that does no I/O, tested on the host, and a thin layer for each
 platform. Linux and macOS work today. Windows and RingTail are next (see TODO.md).
 
-Status: v0.1.0, the base. It talks to the Anthropic Messages API and has six tools. It has not
-yet been used on a real task with a real key; what is tested is described below.
+Status: v0.2.0. It talks to the Anthropic Messages API (and anything that speaks it) and has six
+tools. It has done real work against a live model: multi-file bug fixes, a refactor across a
+project, edits that keep CRLF and tabs, paging through a 7,000-line file, background builds and
+servers, timers, and interactive sessions with Ctrl-C.
 
 ## Use
 
@@ -25,8 +27,13 @@ DeepSeek works through its Anthropic-compatible route: `ANTHROPIC_BASE_URL=https
 with `-m deepseek-flash` (checked live: tools, caching, thinking blocks and background wake-ups all behave).
 
 In a session, `/clear` forgets the conversation, `/exit` or Ctrl-D quits, and Ctrl-C stops what
-is running (twice at the prompt quits). Type while it works and your message is queued.
+is running (twice at the prompt quits); the model is told it was interrupted. Type while it works
+and your message is queued. While a reply is on its way, a line counts the seconds.
 `barb -p` exits 1 if the API call failed, so a script can tell.
+
+Project instructions: before the first request Barb reads `AGENTS.md` from the working directory
+(or `CLAUDE.md` if there is none) into the system prompt. A line that is only `@path` is replaced by
+that file, so a `CLAUDE.md` of just `@AGENTS.md` works. `--no-instructions` skips this.
 
 It needs `curl` on the path (it makes the HTTPS requests) and a POSIX shell for the bash tool.
 
@@ -34,7 +41,9 @@ It needs `curl` on the path (it makes the HTTPS requests) and a POSIX shell for 
 
 Six tools: `read_file` (numbered lines, paged), `write_file`, `edit_file` (an exact string,
 which must be unique, in a file it has read), `bash`, `task_stop` and `schedule_wakeup`.
-Writing, editing and commands ask first: `y`, `n`, or `a` for always this session.
+Writing, editing and commands ask first: one key, `y`, `n`, or `a` for always this session (Enter
+or Escape is no). Anything typed before the question appeared is thrown away, so a line typed ahead
+cannot answer it.
 
 The part it was written for: anything slow runs as a background task, and the agent goes to sleep.
 `bash` with `run_in_background` returns a task number at once and writes the output to
@@ -61,10 +70,10 @@ it does not know intact.
   session for the permission prompts, Ctrl-C, timeouts, retries, and a check that the API key is
   never on a command line.
 
-The tests were mutation-checked: 28 deliberate breakages, all caught except one that is equivalent
-(a redundant check that only improves an error message). One real run against the live API with
-an invalid key confirmed TLS and the error path. Not tested: a real conversation with a valid key,
-macOS, and long sessions.
+`tools/mutate.py` breaks the code on purpose in listed ways and checks that a test fails each
+time; every mutation in its table is caught. The out-of-memory test refuses allocations two ways,
+every one from a point on and exactly one, and checks that a refusal always ends in a clean
+"Out of memory" stop. Not tested: macOS, and sessions long enough to fill the context window.
 
 ## Limits
 
@@ -72,7 +81,6 @@ macOS, and long sessions.
 - No compaction: when the conversation outgrows the model's context window, the API says so and
   you `/clear`.
 - The conversation is not saved between runs.
-- No project instructions file is read yet (AGENTS.md, CLAUDE.md).
 - A command that is not run in the background is killed, with its children, when it ends or after
   its timeout (default 2 minutes, at most 10). Background tasks are killed when Barb exits.
 - `edit_file` and `write_file` follow symbolic links and write atomically, but do not keep file

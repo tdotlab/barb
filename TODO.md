@@ -1,22 +1,15 @@
 # To do
 
-Where Barb stands: v0.1.0, the base. The core, six tools and the Linux/macOS platform work and are
-tested; nothing has been tried on a real task with a real key. Each task below stands on its own.
-Model suggestions are for Claude and Codex: [Claude: Haiku, Sonnet, Opus] [Codex: Luna, Sol].
-
-## First, before anything else
-
-**A real session.** Run `barb` with a real key on a small real task (edit a file, run a test,
-a background build). Everything so far is tested against fakes and one invalid-key request; this is
-where the surprises will be. Not a coding task: T does it, and writes down what felt wrong.
+Where Barb stands: v0.2.0. The core, six tools and the Linux/macOS platform work, and have done real
+tasks against a live model (DeepSeek through its Anthropic-compatible route): multi-file fixes, a
+refactor, CRLF edits, a 7,000-line file, background builds and servers, timers, and interactive
+sessions. Each task below stands on its own. Model suggestions are for Claude and Codex:
+[Claude: Haiku, Sonnet, Opus] [Codex: Luna, Sol].
 
 ## Next
 
-**Project instructions.** Read `AGENTS.md` (and `CLAUDE.md`) from the working directory into the
-system prompt, as T's repos already assume. Small: the platform reads the file (a READ action) before
-the first request and the core adds it to the system prompt. Sonnet high, Codex Luna high.
-
-**Streaming replies.** Show text as it is written, and lift the non-streaming limit on long replies.
+**Streaming replies.** The biggest gap in daily use: a long answer arrives after a minute of the
+waiting line. Show text as it is written, and lift the non-streaming limit on long replies.
 A server-sent-events parser in the core (host-tested against recorded streams), partial tool input
 accumulated as JSON, and `ops_http` passing curl's output through in pieces (`EV_HTTP_CHUNK`).
 The design is the hard part. Opus high, Codex Sol high.
@@ -50,9 +43,6 @@ for `fetch -d`, Opus high for the platform. Later: MicroPython on RingTail, so t
 Python there.
 
 ## Tests worth adding
-
-**A mutation runner in the repo.** The one used for the 0.1 checks lives outside it (see AGENTS.md).
-Sonnet medium.
 
 **macOS.** Run `make test` on a Mac. Probably only `ops.c` details (`pgrep`, `/proc` in the e2e key
 check, which is Linux-only) need changes.

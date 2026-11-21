@@ -106,8 +106,11 @@ static str_t build_system(agent_t* g) {
         "Report results faithfully: if a test fails, or you did not run something, say so plainly.\n"
         "- Understand before you change. Read the relevant code first. edit_file and write_file refuse "
         "files you have not read in this session.\n"
-        "- Prefer edit_file for existing files, and make the smallest change that does the job, in the "
-        "style of the code around it.\n"
+        "- Use the file tools for files: read_file to read one (not cat, head or sed), edit_file to change part "
+        "of one and write_file to create or replace one (not sed, a heredoc or a script). They check your work "
+        "and show the user what changes; a shell command does neither. Use bash to run things: builds, tests, "
+        "git, searches.\n"
+        "- Make the smallest change that does the job, in the style of the code around it.\n"
         "- Check your work. Run the build or the tests when there are any, and read the real output before "
         "saying something works. If you could not verify a change, say so.\n"
         "- Do not run destructive or hard-to-undo commands (deleting files, force-pushing, resetting "
@@ -121,7 +124,8 @@ static str_t build_system(agent_t* g) {
         "background task: call bash with run_in_background set to true, then end your turn with a line saying "
         "what you are waiting for. Barb sleeps without calling the model and wakes you with a message when the "
         "task exits. To check back at a set time, call schedule_wakeup. Do not poll in a loop, and do not sleep "
-        "inside a bash call to wait for something long.\n\n"
+        "inside a bash call to wait for something long. Once you have started the wait, do not check on it in the "
+        "same reply: the message tells you when there is something to look at.\n\n"
         "Environment\n"
         "Working directory: ");
     sb_puts(&b, g->cfg.cwd);
@@ -130,6 +134,14 @@ static str_t build_system(agent_t* g) {
     sb_putz(&b, "\nDate: ");
     sb_puts(&b, g->cfg.date);
     sb_putc(&b, '\n');
+    if (g->ld_text.n) {
+        sb_putz(&b, "\nProject instructions\nThe user's instructions for this project, from ");
+        sb_puts(&b, g->ld_file);
+        sb_putz(&b, " in the working directory (with the files it imports), in full below, so there is no need to "
+                    "read them again. Follow them; where they conflict with the defaults above, they win.\n\n");
+        sb_puts(&b, g->ld_text);
+        sb_putc(&b, '\n');
+    }
     return sb_str(&b);
 }
 
@@ -203,7 +215,161 @@ static void send_request(agent_t* g) {
     post_request(g);
 }
 
+// ---- the project's instructions ----
+//
+// Before the first request (if the platform asked for it), the agent reads AGENTS.md from the
+// working directory, or CLAUDE.md if there is no AGENTS.md, and puts it in the system prompt. A
+// line that is only "@path" is replaced by that file (one level deep: imports inside an import
+// stay as they are), which is how a CLAUDE.md of just "@AGENTS.md" works. The reads are ordinary
+// READ actions, so every platform gets this for nothing. The message that started it all goes
+// out once they are read; anything typed meanwhile is queued as it would be behind any request,
+// so the turns come out the same as without the instructions.
+
+enum { LD_NONE, LD_AGENTS, LD_CLAUDE, LD_IMPORTS, LD_DONE };
+#define INSTR_MAX 65536
+#define INSTR_IMPORTS 8
+
+static void start_turn(agent_t* g, str_t user_text);
+
+static void ld_read(agent_t* g, str_t path) {
+    act_t* a = emit(g, ACT_READ);
+    a->id = g->ld_op = new_id(g);
+    a->a = path;
+}
+
+// The "@path" line at `line`, or an empty string.
+static str_t import_of(str_t line) {
+    line = str_trim(line);
+    if (line.n < 2 || line.p[0] != '@') return str_of(0, 0);
+    for (size_t i = 1; i < line.n; i++) if (line.p[i] == ' ' || line.p[i] == '\t') return str_of(0, 0);
+    return str_of(line.p + 1, line.n - 1);
+}
+
+static void ld_collect(agent_t* g) {
+    g->ld_nimports = g->ld_next = 0;
+    str_t t = g->ld_text;
+    size_t i = 0;
+    while (i < t.n) {
+        size_t j = i;
+        while (j < t.n && t.p[j] != '\n') j++;
+        str_t path = import_of(str_of(t.p + i, j - i));
+        int dup = !path.n || str_eq(path, g->ld_file);
+        for (int k = 0; !dup && k < g->ld_nimports; k++) dup = str_eq(g->ld_imports[k], path);
+        if (!dup && g->ld_nimports < INSTR_IMPORTS) g->ld_imports[g->ld_nimports++] = str_dup(&g->life, path);  // a copy ends with a NUL
+        i = j + 1;
+    }
+}
+
+// The instructions with each import line replaced by what it names.
+static str_t ld_expand(agent_t* g) {
+    sb_t b;
+    sb_init(&b, &g->life);
+    str_t t = g->ld_text;
+    size_t i = 0;
+    while (i < t.n) {
+        size_t j = i;
+        while (j < t.n && t.p[j] != '\n') j++;
+        str_t line = str_of(t.p + i, j - i);
+        str_t path = import_of(line);
+        int k = 0;
+        while (path.n && k < g->ld_nimports && !str_eq(g->ld_imports[k], path)) k++;
+        if (path.n && k < g->ld_nimports && g->ld_imptext[k].p) {
+            sb_puts(&b, g->ld_imptext[k]);
+            if (g->ld_imptext[k].n && g->ld_imptext[k].p[g->ld_imptext[k].n - 1] != '\n') sb_putc(&b, '\n');
+        } else if (path.n && k < g->ld_nimports) {
+            sb_puts(&b, line);
+            sb_putz(&b, "  [barb: this file could not be read]\n");
+        } else {
+            sb_puts(&b, line);
+            if (j < t.n) sb_putc(&b, '\n');
+        }
+        i = j + 1;
+    }
+    str_t r = sb_str(&b);
+    if (r.n > INSTR_MAX) {
+        sb_t c;
+        sb_init(&c, &g->life);
+        sb_put(&c, r.p, INSTR_MAX);
+        sb_putz(&c, "\n[barb: the instructions were cut here; they are longer than 64 KB]");
+        r = sb_str(&c);
+    }
+    return r;
+}
+
+static void ld_finish(agent_t* g, int start) {
+    g->ld_phase = LD_DONE;
+    g->ld_op = 0;
+    g->state = S_IDLE;
+    if (g->ld_text.n) {
+        g->ld_text = ld_expand(g);
+        g->api.system = build_system(g);
+        sb_t b;
+        sb_init(&b, &g->tmp);
+        sb_putz(&b, "(following the project's instructions in ");
+        sb_puts(&b, g->ld_file);
+        for (int k = 0; k < g->ld_nimports; k++) {
+            sb_putz(&b, k ? ", " : " and ");
+            sb_puts(&b, g->ld_imports[k]);
+        }
+        sb_putz(&b, ")");
+        say(g, SAY_INFO, sb_str(&b));
+    }
+    if (!start) return;
+    note_t *h = g->nhead, *t = g->ntail;
+    g->nhead = g->ntail = 0;
+    start_turn(g, g->ld_held);
+    g->ld_held = str_of(0, 0);
+    if (h) {   // put back what was typed meanwhile, after anything the turn itself queued
+        if (g->ntail) g->ntail->next = h; else g->nhead = h;
+        g->ntail = t;
+    }
+}
+
+static void ld_next(agent_t* g) {
+    if (g->ld_next < g->ld_nimports) {
+        g->ld_phase = LD_IMPORTS;
+        ld_read(g, g->ld_imports[g->ld_next]);
+    } else {
+        ld_finish(g, 1);
+    }
+}
+
+static void on_load(agent_t* g, const ev_t* ev) {
+    g->ld_op = 0;
+    int ok = ev->status == FS_OK;
+    switch (g->ld_phase) {
+    case LD_AGENTS:
+    case LD_CLAUDE:
+        if (ok && str_trim(ev->data).n) {
+            g->ld_file = str_z(g->ld_phase == LD_AGENTS ? "AGENTS.md" : "CLAUDE.md");
+            g->ld_text = str_dup(&g->life, ev->data);
+            ld_collect(g);
+            ld_next(g);
+        } else if (g->ld_phase == LD_AGENTS) {
+            g->ld_phase = LD_CLAUDE;
+            ld_read(g, str_z("CLAUDE.md"));
+        } else {
+            ld_finish(g, 1);
+        }
+        break;
+    case LD_IMPORTS:
+        g->ld_imptext[g->ld_next] = ok ? str_dup(&g->life, ev->data) : str_of(0, 0);
+        if (ok && !g->ld_imptext[g->ld_next].p) g->ld_imptext[g->ld_next] = str_z("");
+        g->ld_next++;
+        ld_next(g);
+        break;
+    }
+}
+
 static void start_turn(agent_t* g, str_t user_text) {
+    if (g->cfg.instructions && g->ld_phase == LD_NONE) {
+        // Read the instructions first; the user's text waits for them.
+        g->ld_held = str_dup(&g->life, user_text);
+        g->state = S_LOAD;
+        g->ld_phase = LD_AGENTS;
+        ld_read(g, str_z("AGENTS.md"));
+        return;
+    }
     msg_t* u = tr_user_msg(&g->life, &g->tr);
     if (!u) return;
     int from_user = flush_notes(g, u);
@@ -454,18 +620,27 @@ static void on_input(agent_t* g, str_t line) {
 
 static void on_interrupt(agent_t* g) {
     switch (g->state) {
-    case S_MODEL: {
+    case S_MODEL:
+    case S_RETRY: {
         act_t* a = emit(g, ACT_CANCEL);
-        a->id = g->http_id;
+        a->id = g->state == S_MODEL ? g->http_id : g->retry_timer;
         g->http_id = 0;
         g->state = S_IDLE;
+        // The message the model never answered stays in the conversation, and whatever the user
+        // types next joins it. Say what happened, or the model takes up the old request as if
+        // nothing had.
+        msg_t* u = tr_user_msg(&g->life, &g->tr);
+        if (u) tr_add_text(&g->life, u, str_z("[barb] The user interrupted you here, before you replied."));
         sayz(g, SAY_INFO, "Interrupted.");
         break;
     }
-    case S_RETRY: {
+    case S_LOAD: {
+        // Go on without the rest of the instructions, and drop what the user had typed.
         act_t* a = emit(g, ACT_CANCEL);
-        a->id = g->retry_timer;
-        g->state = S_IDLE;
+        a->id = g->ld_op;
+        g->nhead = g->ntail = 0;
+        g->ld_held = str_of(0, 0);
+        ld_finish(g, 0);
         sayz(g, SAY_INFO, "Interrupted.");
         break;
     }
@@ -598,6 +773,8 @@ const act_t* agent_step(agent_t* g, const ev_t* ev, size_t* n) {
         case EV_EOF: g->eof = 1; break;
         case EV_HTTP: on_http(g, ev); break;
         case EV_FILE:
+            if (g->state == S_LOAD && g->ld_op && ev->id == g->ld_op) { on_load(g, ev); break; }
+            // fall through
         case EV_ANSWER:
             if (g->state == S_TOOLS && g->tc.op && ev->id == g->tc.op) {
                 tool_event(g, &g->calls[g->cur], ev);
@@ -624,3 +801,5 @@ const act_t* agent_step(agent_t* g, const ev_t* ev, size_t* n) {
     *n = g->nacts;
     return g->acts;
 }
+
+int agent_busy(const agent_t* g) { return !g->done && g->state != S_IDLE; }

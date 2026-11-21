@@ -5,7 +5,7 @@
 #include "agent.h"
 #include "api.h"
 
-typedef enum { S_IDLE, S_MODEL, S_RETRY, S_TOOLS } gstate_t;
+typedef enum { S_IDLE, S_MODEL, S_RETRY, S_TOOLS, S_LOAD } gstate_t;
 
 typedef struct {
     str_t id, name, input;
@@ -68,6 +68,15 @@ struct agent {
     str_t* seen;           // files the model has read (or written) this session
     int nseen, capseen;
     unsigned always;       // BIT_*: the user said yes-always
+
+    int ld_phase;          // LD_*: reading the project's instructions
+    int64_t ld_op;         // the read in flight
+    str_t ld_file;         // the file the instructions came from
+    str_t ld_text;         // the text so far
+    str_t ld_held;         // what the user typed that started the session; it goes once they are read
+    str_t ld_imports[8];   // the "@file" lines it names, read one after another
+    str_t ld_imptext[8];   // and what each one held
+    int ld_nimports, ld_next;
 
     int turns;             // model calls since the user last spoke
     int limit_said;

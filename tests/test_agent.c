@@ -346,7 +346,9 @@ static void test_interrupts(void) {
     w_reply_text(w, "ok");
     w_input(w, "second");
     char* t = w_last_user_text(w);
-    CHECK_STR(str_z(t), "first|second");
+    // ...with a line saying it was interrupted, so the model does not take up the old request as if
+    // nothing had happened.
+    CHECK_STR(str_z(t), "first|[barb] The user interrupted you here, before you replied.|second");
     free(t);
     w_free(w);
 
@@ -622,13 +624,200 @@ static void random_reply(world_t* w) {
     }
 }
 
+// The body of the last request, as a C string the test can search.
+static const char* last_body(world_t* w) { return w->nbodies ? w->bodies[w->nbodies - 1] : ""; }
+
+static int count_reads(world_t* w, const char* path) {
+    int n = 0;
+    for (int i = 0; i < w->nops; i++) if (w->ops[i].kind == ACT_READ && !strcmp(w->ops[i].a, path)) n++;
+    return n;
+}
+
+static void test_instructions(void) {
+    // AGENTS.md, with an import, goes into the system prompt before the first request.
+    world_t* w = w_new_cfg(1, 0, 1);
+    w_put_file(w, "AGENTS.md", "Be terse.\n@docs/STYLE.md\nThe end.\n");
+    w_put_file(w, "docs/STYLE.md", "Use tabs.");
+    CHECK(!agent_busy(w->g));
+    w_reply_text(w, "ok");
+    w_input(w, "hi");
+    CHECK_INT(count_reads(w, "AGENTS.md"), 1);
+    CHECK_INT(count_reads(w, "docs/STYLE.md"), 1);
+    CHECK_INT(count_reads(w, "CLAUDE.md"), 0);
+    CHECK_INT(w->nbodies, 1);
+    const char* b = last_body(w);
+    CHECK(strstr(b, "Project instructions") != 0);
+    CHECK(strstr(b, "from AGENTS.md in the working directory (with the files it imports), in full below") != 0);
+    CHECK(strstr(b, "Be terse.\\nUse tabs.\\nThe end.") != 0);   // the import line replaced, in order
+    CHECK(strstr(b, "@docs/STYLE.md") == 0);
+    CHECK(w_said(w, "(following the project's instructions in AGENTS.md and docs/STYLE.md)"));
+    char* t = w_last_user_text(w);
+    CHECK_STR(str_z(t), "hi");
+    free(t);
+    CHECK(!agent_busy(w->g));
+    // Read once per session, not per message; /clear keeps them.
+    w_reply_text(w, "ok");
+    w_input(w, "/clear");
+    w_input(w, "again");
+    CHECK_INT(count_reads(w, "AGENTS.md"), 1);
+    CHECK_INT(w->nbodies, 2);
+    CHECK(strstr(last_body(w), "Be terse.") != 0);
+    w_free(w);
+
+    // No AGENTS.md: CLAUDE.md, whose import of the missing AGENTS.md is marked, not dropped silently.
+    w = w_new_cfg(1, 0, 1);
+    w_put_file(w, "CLAUDE.md", "@AGENTS.md\nAlso: no emojis.\n");
+    w_reply_text(w, "ok");
+    w_input(w, "hi");
+    CHECK_INT(count_reads(w, "AGENTS.md"), 2);
+    CHECK_INT(count_reads(w, "CLAUDE.md"), 1);
+    b = last_body(w);
+    CHECK(strstr(b, "from CLAUDE.md in the working directory") != 0);
+    CHECK(strstr(b, "@AGENTS.md  [barb: this file could not be read]") != 0);
+    CHECK(strstr(b, "Also: no emojis.") != 0);
+    w_free(w);
+
+    // Neither file: nothing added, and the request goes out as before.
+    w = w_new_cfg(1, 0, 1);
+    w_reply_text(w, "ok");
+    w_input(w, "hi");
+    CHECK_INT(w->nbodies, 1);
+    CHECK(strstr(last_body(w), "Project instructions") == 0);
+    CHECK(!w_said(w, "following the project"));
+    w_free(w);
+
+    // An empty AGENTS.md counts as none; a directory called AGENTS.md too.
+    w = w_new_cfg(1, 0, 1);
+    w_put_file(w, "AGENTS.md", "  \n\n");
+    w_put_file(w, "CLAUDE.md", "From Claude.");
+    w_reply_text(w, "ok");
+    w_input(w, "hi");
+    CHECK(strstr(last_body(w), "From Claude.") != 0);
+    w_free(w);
+
+    // Turned off: no reads at all.
+    w = w_new_cfg(1, 0, 0);
+    w_put_file(w, "AGENTS.md", "Be terse.");
+    w_reply_text(w, "ok");
+    w_input(w, "hi");
+    CHECK_INT(count_reads(w, "AGENTS.md"), 0);
+    CHECK(strstr(last_body(w), "Be terse.") == 0);
+    w_free(w);
+
+    // Imports: at most eight, each once, and a file does not import itself.
+    w = w_new_cfg(1, 0, 1);
+    w_put_file(w, "AGENTS.md", "@AGENTS.md\n@a\n@b\n@a\n@c\n@d\n@e\n@f\n@g\n@h\n@i\n@ not an import\nx @a\n");
+    const char* names[] = { "a", "b", "c", "d", "e", "f", "g", "h", "i" };
+    for (int i = 0; i < 9; i++) w_put_file(w, names[i], names[i]);
+    w_reply_text(w, "ok");
+    w_input(w, "hi");
+    CHECK_INT(count_reads(w, "AGENTS.md"), 1);
+    CHECK_INT(count_reads(w, "a"), 1);
+    CHECK_INT(count_reads(w, "h"), 1);
+    CHECK_INT(count_reads(w, "i"), 0);
+    b = last_body(w);
+    CHECK(strstr(b, "@i  [barb") == 0 && strstr(b, "\\n@i\\n") != 0);   // the ninth stays as written
+    CHECK(strstr(b, "@ not an import") != 0 && strstr(b, "x @a") != 0);
+    w_free(w);
+
+    // Too long: cut at 64 KB, and said so.
+    w = w_new_cfg(1, 0, 1);
+    char* big = malloc(70001);
+    memset(big, 'k', 70000);
+    big[70000] = 0;
+    w_put_file(w, "AGENTS.md", big);
+    free(big);
+    w_reply_text(w, "ok");
+    w_input(w, "hi");
+    CHECK(strstr(last_body(w), "the instructions were cut here") != 0);
+    w_free(w);
+
+    // While they load, the agent is busy. The first message goes out once they are read, and one
+    // typed meanwhile waits for the reply, as it would behind any request: the turns come out the
+    // same as without instructions.
+    w = w_new_cfg(1, 0, 1);
+    w_put_file(w, "AGENTS.md", "Be terse.");
+    w->hold_fs = 1;
+    w_input(w, "alpha-msg");
+    CHECK(agent_busy(w->g));
+    w_input(w, "beta-msg");
+    CHECK(w_said(w, "(queued"));
+    CHECK_INT(w->nbodies, 0);
+    w->hold_fs = 0;
+    w_reply_text(w, "one");
+    w_reply_text(w, "two");
+    w_event(w, EV_FILE, w_last_op(w, ACT_READ), FS_OK, 0, "Be terse.");
+    CHECK_INT(w->nbodies, 2);
+    t = w_last_user_text(w);
+    CHECK_STR(str_z(t), "beta-msg");
+    free(t);
+    CHECK(strstr(w->bodies[0], "\"alpha-msg\"") != 0 && strstr(w->bodies[0], "beta-msg") == 0);
+    w_free(w);
+
+    // Ctrl-C while they load: drop what was typed, carry on without them, and do not try again.
+    w = w_new_cfg(1, 0, 1);
+    w->hold_fs = 1;
+    w_input(w, "first");
+    w_input(w, "also-typed");
+    int64_t rd = w_last_op(w, ACT_READ);
+    w_event(w, EV_INTERRUPT, 0, 0, 0, 0);
+    CHECK(w_op(w, rd)->cancelled);
+    CHECK(!agent_busy(w->g));
+    CHECK_INT(w->nbodies, 0);
+    w_event(w, EV_FILE, rd, FS_OK, 0, "LATE-READ-TEXT");   // the cancelled read answers anyway: ignored
+    CHECK_INT(w->nbodies, 0);
+    w->hold_fs = 0;
+    w_reply_text(w, "ok");
+    w_input(w, "second");
+    CHECK_INT(w->nbodies, 1);
+    t = w_last_user_text(w);
+    CHECK_STR(str_z(t), "second");
+    free(t);
+    CHECK(strstr(last_body(w), "LATE-READ-TEXT") == 0);
+    CHECK_INT(w->nops, 2);   // the one read, then the request: no second attempt
+    w_free(w);
+
+    // -p: the prompt then end of input; the instructions still come first.
+    w = w_new_cfg(1, 0, 1);
+    w_put_file(w, "AGENTS.md", "Be terse.");
+    w_reply_text(w, "done");
+    w_input(w, "task");
+    w_event(w, EV_EOF, 0, 0, 0, 0);
+    CHECK(w->done);
+    CHECK_INT(w->exit_code, 0);
+    CHECK(strstr(last_body(w), "Be terse.") != 0);
+    w_free(w);
+}
+
+static void test_busy(void) {
+    world_t* w = w_new(0);
+    CHECK(!agent_busy(w->g));
+    w->hold_http = 1;
+    w_input(w, "hi");
+    CHECK(agent_busy(w->g));                         // asking the model
+    w->hold_http = 0;
+    w_reply_tools(w, TOOL("t1", "bash", J({"command":"echo hi"})));
+    w_event(w, EV_HTTP, w_last_op(w, ACT_HTTP), 200, 0, w->replies[w->irep++]);
+    CHECK(agent_busy(w->g));                         // asking the user about a tool call
+    w_reply_text(w, "ok");
+    w_event(w, EV_ANSWER, w_last_op(w, ACT_ASK), ANS_YES, 0, 0);
+    CHECK(!agent_busy(w->g));                        // done: the prompt may show
+    w_reply_tools(w, TOOL("t2", "bash", J({"command":"sleep 9","run_in_background":true})));
+    w_reply_text(w, "waiting");
+    w->ask_answer = ANS_YES;
+    w_input(w, "start it");
+    CHECK(!agent_busy(w->g));                        // a background task is not the agent being busy
+    w_free(w);
+}
+
 static void test_random_events(void) {
     long total_requests = 0;
     h_quiet = 1;
     for (unsigned seed = 1; seed <= 400; seed++) {
         rnd_state = seed * 7919u;
-        world_t* w = w_new_turns(rnd(2), 1 + (int)rnd(8));
+        world_t* w = w_new_cfg(rnd(2), 1 + (int)rnd(8), rnd(2));
         w_put_file(w, "f.txt", "x\nx\n");
+        if (rnd(2)) w_put_file(w, "AGENTS.md", "Rules.\n@f.txt\n@gone\n");
         w->hold_http = (int)rnd(3) == 0;
         w->hold_proc = (int)rnd(3) == 0;
         w->ask_answer = (int)rnd(4) - 1;               // -1 leaves questions open
@@ -675,20 +864,31 @@ static void scenario(world_t* w) {
 
 static void test_out_of_memory(void) {
     int clean = 0, fatal = 0, never_started = 0;
+    // Twice: once with every allocation refused from the k-th on, once with only the k-th refused
+    // (which is where a failure that is quietly shrugged off would go unnoticed).
+    for (int once = 0; once <= 1; once++)
     for (long k = 0; k < 600; k++) {
+        mem_fail_once = once;
         mem_count = 0;
+        mem_refused = 0;
         mem_fail_after = k;
-        world_t* w = w_new(1);
+        world_t* w = w_new_cfg(1, 0, 1);
         if (!w->g) { never_started++; w_free(w); continue; }
+        w_put_file(w, "AGENTS.md", "Rules.\n@a.txt\n");
         scenario(w);
         if (w->done && w->exit_code == 1) fatal++;
         else clean++;
+        // The rule: a refused allocation is never shrugged off. If one was refused, the agent said
+        // so and stopped; if none was, it carried on as normal (here: waiting for its timer).
+        if (mem_refused) { CHECK(w->done && w->exit_code == 1 && w_said(w, "Out of memory")); }
+        else { CHECK(!w->done && !w_said(w, "Out of memory")); }
         mem_fail_after = -1;
         w_free(w);
         if (mem_live != 0) { printf("leak after failing allocation %ld: %ld live\n", k, mem_live); mem_live = 0; checks_failed++; }
         checks_run++;
     }
     mem_fail_after = -1;
+    mem_fail_once = 0;
     CHECK(fatal > 0);          // running out of memory is reported and stops the agent...
     CHECK(clean > 0);          // ...and with enough memory the scenario completes
     CHECK(never_started > 0);
@@ -707,6 +907,8 @@ int main(void) {
     test_background();
     test_wakeup();
     test_interrupts();
+    test_instructions();
+    test_busy();
     test_api_errors();
     test_queued_and_turns();
     test_commands();

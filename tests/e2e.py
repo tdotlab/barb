@@ -5,7 +5,7 @@ The fake server plays a script of replies, checks what barb sends (headers, that
 valid UTF-8 JSON, that the API key never appears on a command line), and the test checks what
 barb did to the files, how long it waited, and its exit status. Usage: e2e.py PATH_TO_BARB
 """
-import itertools, json, os, pty, select, signal, subprocess, sys, tempfile, threading, time
+import itertools, json, os, pty, re, select, signal, subprocess, sys, tempfile, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BARB = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "build/barb")
@@ -351,9 +351,9 @@ def test_interactive_permissions():
     ])
     code, out, left = pty_session([BARB], d, env_for(fake), [
         ("> ", "make files\n"),
-        ("Allow?", "y\n"),          # yes.txt: allowed
-        ("Allow?", "n\n"),          # no.txt: refused
-        ("Allow?", "a\n"),          # the bash command: always
+        ("Allow?", "y"),            # yes.txt: allowed, with one key and no Enter
+        ("Allow?", "n"),            # no.txt: refused
+        ("Allow?", "a"),            # the bash command: always
         ("finished", "\x04"),       # Ctrl-D at the prompt ends the session
     ])
     check(not left, f"every step of the conversation happened; left: {[x[0] for x in left]}\n{out!r}")
@@ -362,6 +362,10 @@ def test_interactive_permissions():
     check(os.path.exists(os.path.join(d, "ran.txt")), "the command ran after a (always)")
     check(os.path.exists(os.path.join(d, "again.txt")), "an always-allowed command ran without asking again")
     check(out.count("Allow?") == 3, f"asked {out.count('Allow?')} times")
+    lines = [re.sub(r"\x1b\[[0-9;]*[mK]", "", l) for l in out.replace("\r", "\n").split("\n")]
+    busy = [l for l in lines if l.startswith("> [tokens") or l.startswith(">   ")]
+    check(not busy, f"no prompt is drawn while the agent is still working: {busy}")
+    check(out.count("yes\n") + out.count("yes\r\n") >= 1 and "always" in out, "the answer is echoed as a word")
     check("write_file wants to:" in out and "create yes.txt" in out, "the question says what it wants to do")
     check(code == 0, f"exit {code}")
     if len(fake.requests) >= 3:
@@ -369,6 +373,44 @@ def test_interactive_permissions():
         check(res is not None and "declined" in res, f"model told: {res!r}")
         res, _ = result_of(fake.requests[2], "toolu_bash_1")
         check(res is not None and res.endswith("[exit code: 0]"), f"the command ran after a: {res!r}")
+    fake.stop()
+
+
+def test_one_key_typeahead():
+    """A line typed while the model works must not answer the question that follows."""
+    d = tempfile.mkdtemp()
+    def slow_tools(req):
+        time.sleep(3.5)
+        return tools(("write_file", {"path": "ahead.txt", "content": "x"}))
+    fake = Fake([slow_tools, text("ok")])
+    code, out, left = pty_session([BARB], d, env_for(fake), [
+        ("> ", "go\n"),
+        ("waiting for the model", "yyy"),   # typed ahead, before the question exists
+        ("Allow?", "n"),
+        ("ok", "\x04"),
+    ], timeout=30)
+    check(not left, f"typeahead session finished; left {[x[0] for x in left]}\n{out!r}")
+    check(not os.path.exists(os.path.join(d, "ahead.txt")), "keys typed before the question did not answer it")
+    check("waiting for the model" in out, "a slow reply shows the waiting line")
+    fake.stop()
+
+
+def test_instructions():
+    d = tempfile.mkdtemp()
+    with open(os.path.join(d, "AGENTS.md"), "w") as f: f.write("Always answer in French.\n@STYLE.md\n")
+    with open(os.path.join(d, "STYLE.md"), "w") as f: f.write("Tabs, not spaces.\n")
+    fake = Fake([text("d'accord"), text("ok")])
+    p, _ = run(fake, ["-p", "hi"], d)
+    check(p.returncode == 0, f"exit {p.returncode}: {p.stderr}")
+    sysp = fake.requests[0].get("system", []) if fake.requests else []
+    sysp = " ".join(b.get("text", "") for b in sysp) if isinstance(sysp, list) else str(sysp)
+    check("Always answer in French." in sysp and "Tabs, not spaces." in sysp, "AGENTS.md and its import are in the system prompt")
+    check("following the project's instructions in AGENTS.md and STYLE.md" in p.stderr, f"and the user is told: {p.stderr!r}")
+    p, _ = run(fake, ["-p", "hi", "--no-instructions"], d)
+    sysp = fake.requests[1].get("system", []) if len(fake.requests) > 1 else []
+    sysp = " ".join(b.get("text", "") for b in sysp) if isinstance(sysp, list) else str(sysp)
+    check(len(fake.requests) == 2 and "French" not in sysp, "--no-instructions leaves them out")
+    no_problems(fake, "instructions")
     fake.stop()
 
 
@@ -384,7 +426,8 @@ def test_startup_errors():
 
 if __name__ == "__main__":
     for t in (test_startup_errors, test_files_and_bash, test_background_wake, test_timeout_and_interrupt,
-              test_permissions_and_errors, test_interactive_pipe, test_interactive_interrupt, test_interactive_permissions):
+              test_permissions_and_errors, test_interactive_pipe, test_interactive_interrupt, test_interactive_permissions,
+              test_one_key_typeahead, test_instructions):
         t()
     print(f"e2e: {checks} checks, {failed} failed")
     sys.exit(1 if failed else 0)

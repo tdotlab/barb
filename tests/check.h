@@ -35,10 +35,12 @@ static int checks_report(const char* name) {
 }
 
 // A mem_t over the C heap, optionally failing after `fail_after` allocations.
-static long mem_count, mem_fail_after = -1;
+static long mem_count, mem_fail_after = -1, mem_refused;
+static int mem_fail_once;   // refuse only allocation number mem_fail_after, not every one from there on
 static long mem_live;
 static void* t_alloc(size_t n) {
-    if (mem_fail_after >= 0 && mem_count >= mem_fail_after) return 0;
+    if (mem_fail_once && mem_count == mem_fail_after) { mem_count++; mem_refused++; return 0; }
+    if (!mem_fail_once && mem_fail_after >= 0 && mem_count >= mem_fail_after) { mem_refused++; return 0; }
     mem_count++;
     void* p = malloc(n);
     if (p) mem_live++;

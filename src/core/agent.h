@@ -15,8 +15,10 @@
 // waiting for (a reply to something it cancelled) is ignored.
 //
 // Memory: strings in the actions returned by agent_step stay valid until the
-// next call to agent_step, so the platform copies what it keeps. Strings in
-// an event are the platform's and need only live through the call.
+// next call to agent_step, so the platform copies what it keeps. Each one is
+// followed by a NUL byte (not counted in n), so the platform may hand .p to
+// a C function such as open(). Strings in an event are the platform's and
+// need only live through the call.
 #ifndef BARB_AGENT_H
 #define BARB_AGENT_H
 
@@ -78,6 +80,8 @@ typedef struct {
     str_t date;              // YYYY-MM-DD, shown to the model
     int auto_approve;        // do not ask before writing files or running commands
     int max_turns;           // model calls per user message (a runaway guard); 0 for the default
+    int instructions;        // before the first request, read AGENTS.md (or else CLAUDE.md) from the working
+                             // directory, with the files its "@file" lines name, into the system prompt
 } agent_cfg_t;
 
 typedef struct agent agent_t;
@@ -88,5 +92,10 @@ void agent_free(agent_t* g);
 
 // Feed one event; get the actions to carry out, in order.
 const act_t* agent_step(agent_t* g, const ev_t* ev, size_t* n);
+
+// 1 while the agent is working on a turn (asking the model, running tools, reading the project's
+// instructions); 0 when it is waiting for the user, even if background tasks or timers are pending.
+// A platform shows its input prompt only when this is 0.
+int agent_busy(const agent_t* g);
 
 #endif

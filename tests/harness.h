@@ -192,6 +192,10 @@ static void check_body(const char* body) {
 // ---- carrying out actions ----
 
 static void w_act(world_t* w, const act_t* a) {
+    // The contract in agent.h: every string in an action is followed by a NUL.
+    CHECK(!a->a.p || a->a.p[a->a.n] == 0);
+    CHECK(!a->b.p || a->b.p[a->b.n] == 0);
+    CHECK(!a->c.p || a->c.p[a->c.n] == 0);
     switch (a->kind) {
     case ACT_SAY:
         if (w->nsays < 256) { w->says[w->nsays] = strndup(a->a.p ? a->a.p : "", a->a.n); w->style[w->nsays++] = a->flag; }
@@ -311,13 +315,22 @@ static op_t* w_op(world_t* w, int64_t id) {
     return 0;
 }
 
-static world_t* w_new_turns(int auto_approve, int max_turns) {
+static world_t* w_new_cfg(int auto_approve, int max_turns, int instructions) {
     world_t* w = calloc(1, sizeof *w);
-    agent_cfg_t cfg = { str_z("claude-test"), 0, str_z("/work"), str_z("TestOS"), str_z("2026-11-21"), auto_approve, max_turns };
+    agent_cfg_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.model = str_z("claude-test");
+    cfg.cwd = str_z("/work");
+    cfg.platform = str_z("TestOS");
+    cfg.date = str_z("2026-11-21");
+    cfg.auto_approve = auto_approve;
+    cfg.max_turns = max_turns;
+    cfg.instructions = instructions;
     w->g = agent_new(&test_mem, &cfg);
     w->ask_answer = -1;
     return w;
 }
+static world_t* w_new_turns(int auto_approve, int max_turns) { return w_new_cfg(auto_approve, max_turns, 0); }
 static world_t* w_new(int auto_approve) { return w_new_turns(auto_approve, 0); }
 
 static void w_free(world_t* w) {

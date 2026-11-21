@@ -80,9 +80,8 @@ The rules that keep this project what it is:
   happens in between. `tests/harness.h` checks this on every request the agent builds; if you
   change the agent, the chaos test in `tests/test_agent.c` is the one that will tell you.
 - Tool results are written for a model to read: say what happened and what to do next.
-- New code gets tests, and the tests get mutation-checked: break the code on purpose in a few
-  places and make sure a test fails each time. (The harness used for that is not in the repo;
-  it is a few lines of Python that edit a source file, run one test target and restore the file.
-  Rebuild after restoring, or the next run tests the broken binary.)
+- New code gets tests, and the tests get mutation-checked: add the ways it could break to the
+  table in `tools/mutate.py` and run it (`python3 tools/mutate.py WORD` runs the matching ones).
+  Every mutation must be caught, or carry a note saying why it changes nothing.
 - Sanitizer builds need gcc here; this container's clang has no sanitizer runtime. Both
   compilers build the project clean with `-Wall -Wextra -Werror`.

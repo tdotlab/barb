@@ -14,13 +14,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <sys/utsname.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 #include "../core/agent.h"
 #include "ops.h"
 
-#define VERSION "0.1.0"
+#define VERSION "0.2.0"
 #define DEFAULT_MODEL "claude-sonnet-5-5"
 
 // ---- events waiting for the agent ----
@@ -68,6 +70,54 @@ static int oneshot;            // -p: no prompts, no reading the terminal
 static int need_prompt;
 static int selfpipe[2];
 
+// The terminal while a question waits for its one-key answer.
+static struct termios cooked;
+static int keys_mode;          // the terminal is in one-key mode
+
+// "waiting for the model, 12s": shown on a terminal while a request is out.
+static int64_t http_id;        // the request in flight, or 0
+static int64_t http_since;     // when it went out (ms)
+static int spin_shown;         // the line is on the screen
+static int64_t spin_secs;      // the seconds it shows
+
+static int64_t now_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, 0);
+    return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+static void spin_clear(void) {
+    if (!spin_shown) return;
+    fputs("\r\033[2K", stderr);
+    spin_shown = 0;
+}
+
+static void spin_draw(void) {
+    if (!http_id || !tty_err || awaiting) return;
+    int64_t secs = (now_ms() - http_since) / 1000;
+    if (secs < 2 || (spin_shown && secs == spin_secs)) return;
+    fprintf(stderr, "\r\033[2K\033[2m  waiting for the model, %llds (Ctrl-C stops it)\033[0m", (long long)secs);
+    fflush(stderr);
+    spin_shown = 1;
+    spin_secs = secs;
+}
+
+static void keys_on(void) {
+    if (keys_mode || !tty_in) return;
+    struct termios t = cooked;
+    t.c_lflag &= ~(tcflag_t)(ICANON | ECHO);
+    t.c_cc[VMIN] = 1;
+    t.c_cc[VTIME] = 0;
+    tcflush(0, TCIFLUSH);   // a line typed ahead must not answer the question
+    if (tcsetattr(0, TCSANOW, &t) == 0) keys_mode = 1;
+}
+
+static void keys_off(void) {
+    if (!keys_mode) return;
+    tcsetattr(0, TCSANOW, &cooked);
+    keys_mode = 0;
+}
+
 static void on_signal(int sig) {
     char c = sig == SIGINT ? 'i' : 't';
     ssize_t r = write(selfpipe[1], &c, 1);
@@ -87,6 +137,7 @@ static const char* color(int style) {
 }
 
 static void show(int style, str_t s) {
+    spin_clear();
     if (style == SAY_ASSISTANT) {
         fwrite(s.p, 1, s.n, stdout);
         fputc('\n', stdout);
@@ -113,21 +164,25 @@ static void ask(const act_t* a) {
         return;
     }
     fflush(stdout);
+    spin_clear();
+    keys_on();   // before the question shows, so the flush cannot eat a quick answer
     fprintf(stderr, "\n%s%.*s wants to:%s\n%.*s\n", color(SAY_TOOL), (int)a->a.n, a->a.p, tty_err ? "\033[0m" : "", (int)a->b.n, a->b.p);
     fprintf(stderr, "Allow? [y]es / [n]o / [a]lways this session: ");
+    fflush(stderr);
     awaiting = a->id;
 }
 
 static void exec(const act_t* a) {
     switch (a->kind) {
     case ACT_SAY: show(a->flag, a->a); break;
-    case ACT_HTTP: ops_http(a->id, a->a, a->b); break;
+    case ACT_HTTP: ops_http(a->id, a->a, a->b); http_id = a->id; http_since = now_ms(); break;
     case ACT_READ: ops_read(a->id, a->a); break;
     case ACT_WRITE: ops_write(a->id, a->a, a->b); break;
     case ACT_SPAWN: ops_spawn(a->id, a->a, a->n, a->flag, a->c); break;
     case ACT_TIMER: ops_timer(a->id, a->n); break;
     case ACT_CANCEL:
-        if (a->id == awaiting) { awaiting = 0; fputc('\n', stderr); }
+        if (a->id == http_id) { http_id = 0; spin_clear(); }
+        if (a->id == awaiting) { awaiting = 0; keys_off(); fputc('\n', stderr); }
         else ops_cancel(a->id);
         break;
     case ACT_ASK: ask(a); break;
@@ -136,6 +191,7 @@ static void exec(const act_t* a) {
 }
 
 static void step(const ev_t* ev) {
+    if (ev->kind == EV_HTTP && ev->id == http_id) { http_id = 0; spin_clear(); }
     size_t n;
     const act_t* acts = agent_step(agent, ev, &n);
     for (size_t i = 0; i < n; i++) exec(&acts[i]);
@@ -174,7 +230,33 @@ static void handle_line(char* line, size_t n) {
     deliver_simple(EV_INPUT, 0, 0, line);
 }
 
+// A key pressed while a question waits in one-key mode: y, n or a answers it (Enter, Escape and
+// Ctrl-D say no); anything else is ignored. 1 if it answered.
+static int answer_key(char c) {
+    int ans;
+    const char* word;
+    switch (c) {
+    case 'y': case 'Y': ans = ANS_YES; word = "yes"; break;
+    case 'a': case 'A': ans = ANS_ALWAYS; word = "always"; break;
+    case 'n': case 'N': case '\r': case '\n': case 27: case 4: ans = ANS_NO; word = "no"; break;
+    default: return 0;
+    }
+    int64_t id = awaiting;
+    awaiting = 0;
+    keys_off();
+    fprintf(stderr, "%s\n", word);
+    deliver_simple(EV_ANSWER, id, ans, 0);
+    return 1;
+}
+
 static void read_stdin(void) {
+    if (keys_mode && awaiting) {
+        char c;
+        ssize_t k = read(0, &c, 1);
+        if (k == 1) answer_key(c);
+        else if (k == 0 || (k < 0 && errno != EINTR && errno != EAGAIN)) answer_key('n');
+        return;
+    }
     ssize_t r = read(0, inbuf + inlen, sizeof inbuf - inlen - 1);
     if (r < 0 && (errno == EINTR || errno == EAGAIN)) return;
     if (r <= 0) {
@@ -213,10 +295,12 @@ static void loop(void) {
     for (;;) {
         drain_queue();
         if (done) return;
-        if (need_prompt && tty_in && !oneshot && stdin_open && !awaiting) {
+        if (need_prompt && tty_in && !oneshot && stdin_open && !awaiting && !agent_busy(agent)) {
+            spin_clear();
             fputs("> ", stderr);
             need_prompt = 0;
         }
+        spin_draw();
         int nops = ops_nfds();
         struct pollfd* fds = calloc((size_t)nops + 2, sizeof *fds);
         if (!fds) { exit_code = 1; return; }
@@ -225,7 +309,9 @@ static void loop(void) {
         int stdin_slot = -1;
         if (stdin_open && !oneshot) { stdin_slot = n; fds[n].fd = 0; fds[n].events = POLLIN; n++; }
         ops_fill(fds + n);
-        int r = poll(fds, (nfds_t)(n + nops), ops_timeout_ms());
+        int timeout = ops_timeout_ms();
+        if (http_id && tty_err && (timeout < 0 || timeout > 250)) timeout = 250;  // keep the clock moving
+        int r = poll(fds, (nfds_t)(n + nops), timeout);
         if (r > 0) {
             if (fds[0].revents) read_signals();
             if (stdin_slot >= 0 && fds[stdin_slot].revents) read_stdin();
@@ -247,6 +333,7 @@ static void usage(FILE* f) {
         "  -y, --yes           do not ask before writing files or running commands\n"
         "  -C, --cwd DIR       work in DIR\n"
         "      --max-turns N   stop after N model calls without you typing (default 60)\n"
+        "      --no-instructions  do not read AGENTS.md or CLAUDE.md from the working directory\n"
         "  -V, --version\n"
         "  -h, --help\n\n"
         "environment: ANTHROPIC_API_KEY (required), ANTHROPIC_BASE_URL, BARB_MODEL\n",
@@ -269,13 +356,14 @@ int main(int argc, char** argv) {
     const char* prompt = 0;
     const char* model = getenv("BARB_MODEL");
     const char* cwd_arg = 0;
-    int yes = 0, max_turns = 0;
+    int yes = 0, max_turns = 0, no_instructions = 0;
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
         int has_val = i + 1 < argc;
         if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(stdout); return 0; }
         else if (!strcmp(a, "-V") || !strcmp(a, "--version")) { printf("barb %s\n", VERSION); return 0; }
         else if (!strcmp(a, "-y") || !strcmp(a, "--yes")) yes = 1;
+        else if (!strcmp(a, "--no-instructions")) no_instructions = 1;
         else if ((!strcmp(a, "-p") || !strcmp(a, "--prompt")) && has_val) prompt = argv[++i];
         else if ((!strcmp(a, "-m") || !strcmp(a, "--model")) && has_val) model = argv[++i];
         else if ((!strcmp(a, "-C") || !strcmp(a, "--cwd")) && has_val) cwd_arg = argv[++i];
@@ -316,6 +404,7 @@ int main(int argc, char** argv) {
     oneshot = prompt != 0;
     tty_in = isatty(0);
     tty_err = isatty(2);
+    if (tty_in && tcgetattr(0, &cooked) != 0) tty_in = 0;
 
     if (pipe(selfpipe) < 0) { perror("barb: pipe"); return 1; }
     fcntl(selfpipe[0], F_SETFD, FD_CLOEXEC);
@@ -327,7 +416,15 @@ int main(int argc, char** argv) {
     sigaction(SIGTERM, &sa, 0);
     signal(SIGPIPE, SIG_IGN);
 
-    agent_cfg_t cfg = { str_z(model), 0, str_z(cwd), str_z(plat), str_z(date), yes, max_turns };
+    agent_cfg_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.model = str_z(model);
+    cfg.cwd = str_z(cwd);
+    cfg.platform = str_z(plat);
+    cfg.date = str_z(date);
+    cfg.auto_approve = yes;
+    cfg.max_turns = max_turns;
+    cfg.instructions = !no_instructions;
     agent = agent_new(&mem, &cfg);
     if (!agent) { fprintf(stderr, "barb: out of memory\n"); return 1; }
     ops_init(deliver, base_copy, key);
@@ -340,6 +437,8 @@ int main(int argc, char** argv) {
         deliver_simple(EV_EOF, 0, 0, 0);
     }
     loop();
+    keys_off();
+    spin_clear();
 
     ops_shutdown();
     agent_free(agent);

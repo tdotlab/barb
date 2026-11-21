@@ -31,7 +31,9 @@ sleeping on a long wait: a sleeping agent gets no events and makes no model call
 Every operation the core starts (HTTP request, file read or write, process, timer, question) has an
 id the core chose, and the event that answers it carries the same id. An event with an id the core
 is not waiting for (a late reply to something it cancelled) is ignored. `agent.h` has the full table
-of events and actions.
+of events and actions. Every string in an action ends with a NUL byte, so the platform can pass it
+straight to C (the harness checks this on every action). `agent_busy()` says whether the agent is in
+the middle of a turn; the platform draws its prompt only when it is not.
 
 This is also why the same core can run on Windows, macOS and RingTail: a new platform is a new
 folder that does the same eight things.
@@ -57,6 +59,7 @@ out-of-memory test tries it at every allocation point of a long scenario.
 | `src/posix/ops.c` | processes, curl, files, timers | `tests/e2e.py` |
 | `src/posix/main.c` | arguments, poll loop, terminal | `tests/e2e.py` (pipes and a pseudo-terminal) |
 | `tests/harness.h` | a fake world (scripted model, in-memory files, scripted processes) | used by `test_agent` |
+| `tools/mutate.py` | breaks the code in listed ways and checks a test catches each | run by hand after changing the core |
 
 ## The rules the conversation must keep
 
@@ -74,6 +77,21 @@ The API refuses a conversation that breaks these, and then refuses every later r
   back unchanged.
 - Bytes that are not valid UTF-8 (a binary file read by a tool) become U+FFFD when written, so one
   such file cannot poison the conversation.
+
+## Project instructions
+
+If the platform sets `instructions` in the config, the first message the user sends does not go
+out at once. The agent reads `AGENTS.md` (or else `CLAUDE.md`) with ordinary READ actions, then
+each file named on a line of its own as `@path` (eight at most, one level deep), and puts the text
+in the system prompt; then it sends the message. Anything typed meanwhile is queued as it would be
+behind any request, so the turns come out the same with or without instructions. Ctrl-C during the
+reads goes on without them. Because it is all actions and events, every platform gets it for free.
+
+## Interrupts
+
+Ctrl-C during a model call cancels it and adds "[barb] The user interrupted you here, before you
+replied." to the unanswered message, so the model does not take up the old request when the user
+types next. During tool calls, the running call and the ones after it get results that say so.
 
 ## Sleeping and waking
 
@@ -96,4 +114,5 @@ number in `tc.phase`; keep what it needs between steps in `agent->ta`), and add 
 Implement the eight actions of `agent.h` (say, HTTP, read, write, spawn, timer, cancel, ask, done),
 turn their results into events, and never call the agent re-entrantly. `src/posix/ops.h` is the
 interface the POSIX version uses; it is a good template. The core wants a `mem_t`, the clock only
-through timers the platform runs, and nothing else.
+through timers the platform runs, and nothing else. Show the prompt only when `agent_busy()` is 0,
+and set `instructions` in the config unless the user turned it off.
