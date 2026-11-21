@@ -21,6 +21,8 @@ Options: `-p TASK` (do one task and exit; `-` reads it from standard input), `-m
 `claude-sonnet-5-5`, or `$BARB_MODEL`), `-y/--yes` (do not ask before writing files or running
 commands), `-C DIR`, `--max-turns N` (model calls per message without you typing; default 60).
 `ANTHROPIC_BASE_URL` points it at another endpoint (the tests use a fake one on localhost).
+DeepSeek works through its Anthropic-compatible route: `ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic`
+with `-m deepseek-flash` (checked live: tools, caching, thinking blocks and background wake-ups all behave).
 
 In a session, `/clear` forgets the conversation, `/exit` or Ctrl-D quits, and Ctrl-C stops what
 is running (twice at the prompt quits). Type while it works and your message is queued.
