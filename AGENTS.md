@@ -7,10 +7,10 @@ Read these before changing code:
 - `TODO.md`: what is next, with a model suggestion for each task.
 - `README.md`: what Barb does and how to run it.
 
-`make test` runs everything: the core's unit tests, the agent scenarios and a randomized
-chaos test (all under the address and undefined-behaviour sanitizers), then the end-to-end
-test against a fake API. Run it before committing. It takes about half a minute. On Windows,
-`build.cmd test` is the same (MSVC, AddressSanitizer), plus the line editor's test.
+`make test` runs everything: the core's unit tests, the agent scenarios, a randomized
+chaos test and the line editor's test (all under the address and undefined-behaviour
+sanitizers), then the end-to-end test against a fake API. Run it before committing. It takes
+about half a minute. On Windows, `build.cmd test` is the same (MSVC, AddressSanitizer).
 
 The rules that keep this project what it is:
 

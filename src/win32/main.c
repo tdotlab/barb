@@ -630,7 +630,10 @@ int wmain(int argc, wchar_t** wargv) {
     }
     if (!model || !*model) model = DEFAULT_MODEL;
 
+    // Take the key out of the environment: every command the model runs inherits it otherwise,
+    // and `echo $ANTHROPIC_API_KEY` would show it. Only the platform layer holds it from here.
     char* key = env_utf8(L"ANTHROPIC_API_KEY");
+    SetEnvironmentVariableW(L"ANTHROPIC_API_KEY", 0);
     if (!key || !*key) {
         errz("barb: ANTHROPIC_API_KEY is not set.\n");
         return 2;

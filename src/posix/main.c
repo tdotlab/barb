@@ -372,7 +372,11 @@ int main(int argc, char** argv) {
     }
     if (!model || !*model) model = DEFAULT_MODEL;
 
-    const char* key = getenv("ANTHROPIC_API_KEY");
+    // Take the key out of the environment: every command the model runs inherits it otherwise,
+    // and `echo $ANTHROPIC_API_KEY` would show it. Only the platform layer holds it from here.
+    const char* key_env = getenv("ANTHROPIC_API_KEY");
+    char* key = key_env ? strdup(key_env) : 0;
+    unsetenv("ANTHROPIC_API_KEY");
     if (!key || !*key) {
         fprintf(stderr, "barb: ANTHROPIC_API_KEY is not set.\n");
         return 2;

@@ -1,7 +1,7 @@
 # barb: build and test.
 #   make          build build/barb
-#   make test     the core's unit tests, the agent scenarios (both under the address and
-#                 undefined-behaviour sanitizers), then the end-to-end test against a fake API
+#   make test     the core's unit tests, the agent scenarios and the line editor (all under the
+#                 address and undefined-behaviour sanitizers), then the end-to-end test against a fake API
 #   make clean
 CC ?= gcc
 CFLAGS ?= -O2
@@ -29,15 +29,21 @@ build/test_agent: tests/test_agent.c tests/harness.h tests/check.h $(CORE) $(wil
 	@mkdir -p build
 	$(CC) $(WARN) $(SAN) tests/test_agent.c $(CORE) -o $@
 
+# The Windows line editor is pure bytes (no system calls), so it is tested here too.
+build/test_edit: tests/test_edit.c tests/check.h src/win32/edit.c src/win32/edit.h
+	@mkdir -p build
+	$(CC) $(WARN) $(SAN) tests/test_edit.c src/win32/edit.c -o $@
+
 # The same program with the sanitizers on, for the end-to-end test.
 build/barb-san: $(CORE) $(POSIX) $(wildcard src/core/*.h src/posix/*.h)
 	@mkdir -p build
 	$(CC) $(WARN) $(SAN) $(CORE) $(POSIX) -o $@
 
-test: build/test_core build/test_api build/test_agent build/barb-san
+test: build/test_core build/test_api build/test_agent build/test_edit build/barb-san
 	build/test_core
 	build/test_api
 	build/test_agent
+	build/test_edit
 	python3 tests/e2e.py build/barb-san
 
 clean:

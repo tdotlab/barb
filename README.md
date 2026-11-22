@@ -111,14 +111,14 @@ in its arguments. RingTail's shell holds 255 characters a line, so a long task g
   chaos test of event orders, and out-of-memory at every allocation point of a long scenario. A fake
   model and a fake world run the whole agent, and every request it builds is checked against the
   rules the API enforces (see docs/ARCHITECTURE.md);
+- `test_edit`: the Windows line editor (pure bytes, so it runs everywhere), played on a terminal
+  emulator in both of the console's wrapping modes, with a randomized run of keys;
 - `tests/e2e.py`: the real binary against a fake API on localhost, including a pseudo-terminal
-  session for the permission prompts, Ctrl-C, timeouts, retries, and a check that the API key is
-  never on a command line.
+  session for the permission prompts, Ctrl-C, timeouts, retries, and checks that the API key is
+  never on a command line and never in the environment of a command the model runs.
 
-On Windows, `build.cmd test` runs the same three under AddressSanitizer, plus `test_edit` (the line
-editor, played on a terminal emulator in both of the console's wrapping modes, with a randomized
-run of keys), then `tests/e2e.py` against `build\barb-san.exe`; the pseudo-terminal session is a
-ConPTY there.
+On Windows, `build.cmd test` runs the same under AddressSanitizer, then `tests/e2e.py` against
+`build\barb-san.exe`; the pseudo-terminal session is a ConPTY there.
 
 `tools/mutate.py` breaks the code on purpose in listed ways and checks that a test fails each
 time; every mutation in its table is caught. The out-of-memory test refuses allocations two ways,
@@ -137,8 +137,9 @@ Not tested: macOS, and sessions long enough to fill the context window.
 - `edit_file` and `write_file` follow symbolic links and write atomically, but do not keep file
   ownership.
 - The request body, which includes your files' contents, is written to a mode-0600 temporary file
-  for curl and removed afterwards. The API key goes to curl on standard input, not the command line.
-  If `ANTHROPIC_BASE_URL` is plain http (other than localhost), Barb warns that the key travels in
+  for curl and removed afterwards. The API key goes to curl on standard input, not the command line,
+  and it is removed from Barb's own environment once read, so the commands the model runs do not
+  inherit it. If `ANTHROPIC_BASE_URL` is plain http (other than localhost), Barb warns that the key travels in
   the clear.
 
 ## Layout

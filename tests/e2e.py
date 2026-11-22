@@ -241,6 +241,24 @@ def test_files_and_bash():
     fake.stop()
 
 
+def test_key_not_inherited():
+    """The key lives in the platform layer only: a command the model runs must not inherit it."""
+    d = tempfile.mkdtemp()
+    fake = Fake([
+        tools(("bash", {"command": "echo \"[$ANTHROPIC_API_KEY]\"; env | grep -c ANTHROPIC_API_KEY"})),
+        text("done"),
+    ])
+    p, _ = run(fake, ["-p", "show me your environment", "--yes"], d)
+    check(p.returncode == 0, f"exit status {p.returncode}: {p.stderr}")
+    out, err = result_of(fake.requests[1], "toolu_bash_0") if len(fake.requests) == 2 else (None, None)
+    check(out is not None and KEY not in out, f"the key reached a command: {out!r}")
+    check(out is not None and "[]" in out, f"variable should be empty: {out!r}")
+    check(fake.requests and fake.requests[0]["model"] and not any(KEY in json.dumps(r) for r in fake.requests),
+          "the key is in a request body")
+    no_problems(fake, "key_not_inherited")
+    fake.stop()
+
+
 def test_background_wake():
     d = tempfile.mkdtemp()
     fake = Fake([
@@ -380,9 +398,8 @@ def test_interactive_interrupt():
     check(len(fake.requests) == 1, "no model call after the interrupt")
     pr.stdin.write("now do this\n"); pr.stdin.flush()
     time.sleep(1.0)
-    pr.stdin.close()
     try:
-        out, err = pr.communicate(timeout=10)
+        out, err = pr.communicate(timeout=10)      # closes its stdin: barb sees the end of its input
     except subprocess.TimeoutExpired:
         pr.kill(); out, err = pr.communicate(); check(False, "barb did not end at the end of its input")
     check(pr.returncode == 0, f"exit {pr.returncode}: {err}")
@@ -636,7 +653,7 @@ def test_startup_errors():
 
 
 if __name__ == "__main__":
-    for t in (test_startup_errors, test_files_and_bash, test_background_wake, test_timeout_and_interrupt,
+    for t in (test_startup_errors, test_files_and_bash, test_key_not_inherited, test_background_wake, test_timeout_and_interrupt,
               test_permissions_and_errors, test_interactive_pipe, test_interactive_interrupt, test_interactive_permissions,
               test_one_key_typeahead, test_instructions):
         t()

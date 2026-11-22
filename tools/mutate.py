@@ -80,6 +80,8 @@ MUTATIONS = [
     # The Windows front end, through the end-to-end test.
     ("win-stdin-event-auto-reset", "src/win32/main.c",
      "in_ready = CreateEventW(0, TRUE, FALSE, 0);", "in_ready = CreateEventW(0, FALSE, FALSE, 0);", *E2E_WIN),
+    ("win-key-left-in-environment", "src/win32/main.c",
+     'SetEnvironmentVariableW(L"ANTHROPIC_API_KEY", 0);', "", *E2E_WIN),
 ]
 
 WIN = os.name == "nt"
