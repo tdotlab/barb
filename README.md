@@ -25,6 +25,8 @@ commands), `-C DIR`, `--max-turns N` (model calls per message without you typing
 `ANTHROPIC_BASE_URL` points it at another endpoint (the tests use a fake one on localhost).
 DeepSeek works through its Anthropic-compatible route: `ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic`
 with `-m deepseek-flash` (checked live: tools, caching, thinking blocks and background wake-ups all behave).
+OpenRouter works too: `ANTHROPIC_BASE_URL=https://openrouter.ai/api` with an OpenRouter key and a model
+like `-m deepseek/deepseek-chat` (it accepts the `x-api-key` header Barb sends; checked live).
 
 In a session, `/clear` forgets the conversation, `/exit` or Ctrl-D quits, and Ctrl-C stops what
 is running (twice at the prompt quits); the model is told it was interrupted. Type while it works
