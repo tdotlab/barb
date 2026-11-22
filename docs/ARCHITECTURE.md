@@ -63,10 +63,35 @@ out-of-memory test tries it at every allocation point of a long scenario.
 | `src/win32/main.c` | arguments, the `WaitForMultipleObjects` loop, the console in raw mode, Ctrl-C | `tests/e2e.py` (pipes, a hidden console, a ConPTY) |
 | `src/ui/edit.c` | the prompt's line editor, shared by POSIX and Windows: no I/O, it returns the bytes to draw | `test_edit` (a terminal emulator, both wrapping modes, random keys) |
 | `src/ui/keys.c` | turns a terminal's bytes into keys: escape sequences, UTF-8, bracketed paste; the caller times out a lone Escape | `test_keys` |
+| `src/ui/md.c` | markdown to styled, wrapped terminal text, one reply at a time; `md_safe` makes any text safe to print | `test_md` (the emulator, every construct, hostile bytes, random input) |
+| `src/ui/screen.c` | everything both front ends show: the record, the activity line, the footer, the questions. It sees every action and event, writes through a callback, and keeps time only through the `now` it is given | `test_screen` (both streams on the emulator, all three modes, random runs) |
+| `tests/term.h` | a small terminal emulator (cursor, wrapping both ways, erases, tabs, the escapes Barb writes) that the `src/ui` tests play their output on | |
 | `src/ringtail/ops.c` | the same on RingTail: `sh -c` as jobs, `fetch` for HTTP, whole-file reads and saves | RingTail's `qemu_test.py`, `barb_tests` |
 | `src/ringtail/main.c` | `/barb.cfg`, the raw-mode line editor, the loop | the same, at the terminal over serial |
 | `tests/harness.h` | a fake world (scripted model, in-memory files, scripted processes) | used by `test_agent` |
-| `tools/mutate.py` | breaks the code in listed ways and checks a test catches each | run by hand after changing the core; on Windows it builds with `build.cmd` and runs the mutations of the core and `src/win32` |
+| `tools/mutate.py` | breaks the code in listed ways and checks a test catches each | run by hand after changing the core or `src/ui`; on Windows it builds with `build.cmd` and runs all but `src/posix`'s |
+
+## The screen
+
+`src/ui/screen.c` owns the terminal; the front ends only feed it and flush what it writes. They
+pass it every action before carrying it out (`sc_action`) and every event before the agent sees it
+(`sc_event`), so it knows what is in flight: the model call, a foreground command, background
+tasks, timers, and a retry after a failed request. Before each wait the loop calls `sc_draw`, and it
+waits at most `sc_next_ms` so the spinner turns; when nothing is animating that is -1 and the loop
+sleeps as before. It has three modes, chosen at startup:
+
+- `SC_REGION` (interactive): the line editor's block is the activity row, a rule, the prompt and the
+  footer (`ed_frame(2, 1)`). Anything printed hides the block first and redraws it after, so output
+  never lands on the prompt.
+- `SC_LITE` (stderr is a terminal but this is not a session, as with `-p`): the styled record, and
+  the activity on one line that is cleared before anything else is written.
+- `SC_PIPE`: the old plain formats, byte for byte; `tests/e2e.py` reads them.
+
+Everything shown that came from outside (the model, a command, a path) goes through `md_safe` or,
+for one-line places, a cleaner that turns control characters into spaces; `test_screen` checks
+that every escape reaching the terminal is one of the few kinds it writes itself (colours, erases,
+cursor moves), whatever the text held. The token count arrives as `SAY_USAGE`
+(`agent.h`); REGION puts it in the footer and the other modes print it as before.
 
 ## The rules the conversation must keep
 

@@ -134,7 +134,7 @@ static const char* color(int style) {
     if (!tty_out) return "";
     switch (style) {
     case SAY_TOOL: return "\033[36m";
-    case SAY_INFO: return "\033[90m";
+    case SAY_INFO: case SAY_USAGE: return "\033[90m";
     case SAY_ERROR: return "\033[31m";
     }
     return "";

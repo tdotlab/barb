@@ -605,8 +605,9 @@ def test_interactive_permissions():
     check(os.path.exists(os.path.join(d, "again.txt")), "an always-allowed command ran without asking again")
     check(out.count("Allow?") == 3, f"asked {out.count('Allow?')} times")
     lines = [re.sub(r"\x1b\[[0-9;]*[mK]", "", l) for l in out.replace("\r", "\n").split("\n")]
-    busy = [l for l in lines if l.startswith("> [tokens") or l.startswith(">   ")]
-    check(not busy, f"no prompt is drawn while the agent is still working: {busy}")
+    # The prompt stays at the bottom while the agent works; what it shows must never land on it.
+    mixed = [l for l in lines if re.match(r">\s*(●|└|\[tokens|Allow\?|  └)", l)]
+    check(not mixed, f"output goes above the prompt, never onto it: {mixed}")
     # A pseudo console may move a colour change ahead of the line end, so look past the escapes.
     plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", out).replace("\r\n", "\n")
     check("yes\n" in plain and "always\n" in plain, "the answer is echoed as a word")

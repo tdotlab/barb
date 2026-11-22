@@ -2,9 +2,6 @@
 #include "edit.h"
 #include <string.h>
 
-#define PROMPT "> "
-#define PROMPT_COLS 2
-
 // ---- UTF-8 ----
 
 static uint32_t decode(const char* s, int n, int* len) {
@@ -52,6 +49,27 @@ int ed_cols(uint32_t c) {
     return 1;
 }
 
+// The length of the escape sequence at s (ESC [ ... and its final byte, or ESC and one byte), or 0.
+static int esc_len(const char* s, size_t n) {
+    if (n < 2 || s[0] != 0x1B) return 0;
+    if (s[1] != '[') return 2;
+    size_t i = 2;
+    while (i < n && !((unsigned char)s[i] >= 0x40 && (unsigned char)s[i] <= 0x7E)) i++;
+    return i < n ? (int)i + 1 : (int)n;
+}
+
+int ed_text_cols(const char* s, size_t n) {
+    int cols = 0;
+    for (size_t i = 0; i < n;) {
+        int k = esc_len(s + i, n - i);
+        if (k) { i += (size_t)k; continue; }
+        int len;
+        cols += ed_cols(decode(s + i, (int)(n - i), &len));
+        i += (size_t)len;
+    }
+    return cols;
+}
+
 // ---- output ----
 
 static void put(ed_t* e, const char* s, int n) {
@@ -74,11 +92,37 @@ static void put_csi(ed_t* e, int n, char final) {   // ESC [ n final
     put(e, b, k);
 }
 
+static void put_up(ed_t* e, int n) { if (n > 0) put_csi(e, n, 'A'); }
+static void put_down(ed_t* e, int n) { if (n > 0) put_csi(e, n, 'B'); }
+
+// A decoration row, cut to leave the last column free (so it never wraps) and with its colours
+// reset after it. Control characters become spaces. The columns it took.
+static int put_decor(ed_t* e, const char* s) {
+    int cols = 0, styled = 0;
+    size_t n = strlen(s);
+    for (size_t i = 0; i < n;) {
+        int k = esc_len(s + i, n - i);
+        if (k) { put(e, s + i, k); styled = 1; i += (size_t)k; continue; }
+        int len;
+        uint32_t c = decode(s + i, (int)(n - i), &len);
+        int ctl = c < 0x20 || c == 0x7F;
+        int w = ctl ? 1 : ed_cols(c);
+        if (cols + w > e->width - 1) break;
+        if (ctl) put(e, " ", 1); else put(e, s + i, len);
+        cols += w;
+        i += (size_t)len;
+    }
+    if (styled) putz(e, "\033[0m");
+    return cols;
+}
+
+// ---- where things are ----
+
 // Where the terminal's cursor is after the prompt and the first `upto` bytes of the line:
 // the row below the prompt's, and the column, which is `width` when the row is full and the
 // terminal is waiting to wrap with the next character.
 static void where(const ed_t* e, int upto, int* row, int* col) {
-    int r = 0, c = PROMPT_COLS;
+    int r = 0, c = e->prompt_cols;
     for (int i = 0; i < upto;) {
         int len;
         int w = ed_cols(decode(e->line + i, e->n - i, &len));
@@ -90,6 +134,13 @@ static void where(const ed_t* e, int upto, int* row, int* col) {
     *col = c;
 }
 
+// The cursor's place for byte `upto`, from the prompt's row: at the start of the next row when
+// the one it is on is full.
+static void cursor_at(const ed_t* e, int upto, int* row, int* col) {
+    where(e, upto, row, col);
+    if (*col >= e->width) { (*row)++; *col = 0; }
+}
+
 // A row filled to the last column leaves the cursor there on some terminals, waiting to wrap,
 // and on the next row on others. A space and a carriage return put it at the start of the next
 // row on both, so the editor always knows where it is.
@@ -99,31 +150,74 @@ static int settle(ed_t* e, int row, int col) {
     return row + 1;
 }
 
+// ---- drawing ----
+
 static void hide(ed_t* e) {
     if (!e->shown) return;
-    if (e->row) put_csi(e, e->row, 'A');
+    put_up(e, e->row);
     putz(e, "\r\033[J");
     e->shown = 0;
     e->row = 0;
 }
 
-// Draw the prompt and the line from the start of the cursor's row, then put the cursor in place.
-static void draw(ed_t* e) {
-    putz(e, PROMPT);
+// From the start of the prompt's row: the prompt, the line and the footer, then the cursor put
+// in place.
+static void draw_line(ed_t* e) {
+    putz(e, e->prompt);
     put(e, e->line, e->n);
     int er, ec;
     where(e, e->n, &er, &ec);
     er = settle(e, er, ec);
-    e->row = er;
+    if (e->has_below) {        // below the line, or below the empty row after a full one
+        putz(e, "\r\n");
+        er++;
+        put_decor(e, e->below);
+    }
     e->shown = 1;
-    if (e->cur == e->n) return;
+    e->dirty &= ~2;
     int cr, cc;
-    where(e, e->cur, &cr, &cc);
-    if (cc >= e->width) { cr++; cc = 0; }     // the next character starts the next row
-    if (er > cr) put_csi(e, er - cr, 'A');
+    cursor_at(e, e->cur, &cr, &cc);
+    e->row = e->nabove + cr;
+    if (e->cur == e->n && !e->has_below) return;   // at the end of the line: already there
+    put_up(e, er - cr);
     putz(e, "\r");
     if (cc) put_csi(e, cc, 'C');
-    e->row = cr;
+}
+
+// Draw the whole block from the start of the cursor's row.
+static void draw(ed_t* e) {
+    for (int i = 0; i < e->nabove; i++) {
+        e->above_cols[i] = put_decor(e, e->above[i]);
+        putz(e, "\r\n");
+    }
+    e->dirty &= ~1;
+    draw_line(e);
+}
+
+// The prompt, the line and the footer again; the rows above stay as they are.
+static void redraw(ed_t* e) {
+    if (!e->shown) return;
+    put_up(e, e->row - e->nabove);
+    putz(e, "\r\033[J");
+    draw_line(e);
+}
+
+// Rewrite the rows above in place and come back to the cursor.
+static void redraw_above(ed_t* e) {
+    e->dirty &= ~1;
+    if (!e->nabove) return;
+    put_up(e, e->row);
+    for (int i = 0; i < e->nabove; i++) {
+        if (i) put_down(e, 1);
+        putz(e, "\r");
+        e->above_cols[i] = put_decor(e, e->above[i]);
+        putz(e, "\033[K");
+    }
+    put_down(e, e->row - (e->nabove - 1));
+    putz(e, "\r");
+    int cr, cc;
+    cursor_at(e, e->cur, &cr, &cc);
+    if (cc) put_csi(e, cc, 'C');
 }
 
 void ed_hide(ed_t* e) {
@@ -131,22 +225,83 @@ void ed_hide(ed_t* e) {
     hide(e);
 }
 
-static void redraw(ed_t* e) {
-    hide(e);
-    draw(e);
-}
-
 void ed_show(ed_t* e) {
     e->outn = 0;
     if (!e->shown) draw(e);
 }
 
+void ed_refresh(ed_t* e) {
+    e->outn = 0;
+    if (!e->shown) return;
+    if (e->dirty & 1) redraw_above(e);
+    if (e->dirty & 2) redraw(e);
+}
+
+void ed_frame(ed_t* e, int nabove, int below) {
+    e->outn = 0;
+    if (nabove < 0) nabove = 0;
+    if (nabove > ED_ABOVE) nabove = ED_ABOVE;
+    below = below != 0;
+    if (nabove == e->nabove && below == e->has_below) return;
+    int shown = e->shown;
+    hide(e);
+    e->nabove = nabove;
+    e->has_below = below;
+    if (shown) draw(e);
+}
+
+// Copy s into dst (cut whole characters to fit) and set `bit` in dirty if it changed.
+static void set_text(char* dst, size_t cap, const char* s, int* dirty, int bit) {
+    if (!s) s = "";
+    size_t n = strlen(s);
+    if (n > cap - 1) {
+        n = cap - 1;
+        while (n && is_cont(s[n])) n--;
+    }
+    if (!strncmp(dst, s, n) && dst[n] == 0) return;
+    memcpy(dst, s, n);
+    dst[n] = 0;
+    *dirty |= bit;
+}
+
+void ed_set_above(ed_t* e, int i, const char* s) {
+    if (i < 0 || i >= ED_ABOVE) return;
+    set_text(e->above[i], sizeof e->above[i], s, &e->dirty, 1);
+}
+
+void ed_set_below(ed_t* e, const char* s) { set_text(e->below, sizeof e->below, s, &e->dirty, 2); }
+
+void ed_set_prompt(ed_t* e, const char* s, int cols) {
+    if (cols < 0 || cols > 20) cols = 2;
+    set_text(e->prompt, sizeof e->prompt, s, &e->dirty, 2);
+    if (cols != e->prompt_cols) { e->prompt_cols = cols; e->dirty |= 2; }
+}
+
 void ed_init(ed_t* e, int width) {
     memset(e, 0, sizeof *e);
+    strcpy(e->prompt, "> ");
+    e->prompt_cols = 2;
     ed_set_width(e, width);
 }
 
 void ed_set_width(ed_t* e, int width) { e->width = width < 10 ? 10 : width; }
+
+void ed_resize(ed_t* e, int width) {
+    e->outn = 0;
+    if (width < 10) width = 10;
+    if (e->shown && width != e->width) {
+        // Where the cursor is now, if the terminal rewrapped every row of the block to the new
+        // width: a decoration row wider than it takes more rows, and the line wraps afresh.
+        int up = 0;
+        for (int i = 0; i < e->nabove; i++) up += e->above_cols[i] > width ? (e->above_cols[i] + width - 1) / width : 1;
+        e->width = width;
+        int cr, cc;
+        cursor_at(e, e->cur, &cr, &cc);
+        e->row = up + cr;
+    }
+    hide(e);
+    e->width = width;
+}
 
 // ---- history ----
 
@@ -192,7 +347,7 @@ static void hist_move(ed_t* e, int dir) {
     e->back = to;
     if (to == 0) load(e, e->draft, e->draftn);
     else load(e, e->hist + at, (int)strlen(e->hist + at));
-    if (e->shown) redraw(e);
+    redraw(e);
 }
 
 // ---- editing ----
@@ -227,20 +382,25 @@ static void insert(ed_t* e, uint32_t ch) {
     char b[4];
     int k = encode(ch, b);
     if (e->n + k > ED_MAX - 1) return;
-    // Typing at the end needs only the character, unless it is one that takes no column: that
-    // belongs to the character before, which may be on the row above the cursor.
+    // Typing at the end needs only the character, unless it is one that takes no column (that
+    // belongs to the character before, which may be on the row above the cursor), or, with a
+    // footer below, one that moves the end of the line onto another row.
+    int r0, c0;
+    where(e, e->n, &r0, &c0);
     int at_end = e->cur == e->n && ed_cols(ch) > 0;
     memmove(e->line + e->cur + k, e->line + e->cur, (size_t)(e->n - e->cur));
     memcpy(e->line + e->cur, b, (size_t)k);
     e->n += k;
     e->cur += k;
     e->line[e->n] = 0;
-    if (at_end && e->shown) {
+    if (!e->shown) return;
+    int r, c;
+    where(e, e->n, &r, &c);
+    if (at_end && e->has_below && (r != r0 || c >= e->width || c0 >= e->width)) at_end = 0;
+    if (at_end) {
         put(e, b, k);
-        int r, c;
-        where(e, e->n, &r, &c);
-        e->row = settle(e, r, c);
-    } else if (e->shown) {
+        e->row = e->nabove + settle(e, r, c);
+    } else {
         redraw(e);
     }
 }
@@ -273,13 +433,25 @@ void ed_key(ed_t* e, int key, uint32_t ch) {
     default: return;
     }
     if (key >= EK_LEFT && key <= EK_WORD_RIGHT && e->cur == was) return;   // nowhere to go
-    if (e->shown) redraw(e);
+    redraw(e);
 }
 
 const char* ed_take(ed_t* e, int* n) {
     e->outn = 0;
     if (e->shown) {
-        if (e->cur != e->n) { e->cur = e->n; redraw(e); }
+        if (e->nabove || e->has_below) {
+            // The decoration goes; the prompt and the line are written again where the block was.
+            hide(e);
+            int nab = e->nabove, below = e->has_below;
+            e->nabove = e->has_below = 0;
+            e->cur = e->n;
+            draw_line(e);
+            e->nabove = nab;
+            e->has_below = below;
+        } else if (e->cur != e->n) {
+            e->cur = e->n;
+            redraw(e);
+        }
         int r, c;
         where(e, e->n, &r, &c);
         if (c < e->width) putz(e, "\r\n");     // a full last row has already put it on a new one

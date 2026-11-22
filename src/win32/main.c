@@ -9,9 +9,10 @@
 // background task uses no CPU in the meantime.
 //
 // The console is put in raw mode for an interactive session: keys arrive one at a time and go
-// to the line editor (edit.c), which draws the prompt with VT sequences. Text goes to the
-// console as UTF-16 (WriteConsoleW), so it shows right whatever the console's code page; to a
-// pipe or a file it goes as the UTF-8 the agent made.
+// to the screen (screen.c), which keeps the prompt, what is going on and a footer at the bottom
+// and draws them with VT sequences. Text goes to the console as UTF-16 (WriteConsoleW), so it
+// shows right whatever the console's code page; to a pipe or a file it goes as the UTF-8 the
+// agent made.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdio.h>
@@ -19,7 +20,7 @@
 #include <string.h>
 #include <time.h>
 #include "../core/agent.h"
-#include "../ui/edit.h"
+#include "../ui/screen.h"
 #include "ops.h"
 
 #define VERSION "0.2.0"
@@ -91,10 +92,7 @@ static HANDLE wake;                             // set by the Ctrl-C handler
 static HANDLE cleaned;                          // set when barb has tidied up, for the close handler
 static volatile LONG interrupts, terminate_now;
 
-static ed_t ed;
-static int64_t http_id, http_since;
-static int spin_shown;
-static int64_t spin_secs;
+static sc_t scr;
 
 // ---- output ----
 
@@ -126,68 +124,50 @@ static void out(const char* s, size_t n) { write_handle(h_out, con_out, s, n); }
 static void err(const char* s, size_t n) { write_handle(h_err, con_err, s, n); }
 static void errz(const char* s) { err(s, strlen(s)); }
 
-static void ed_flush(void) {
-    if (ed.outn) err(ed.out, (size_t)ed.outn);
-    ed.outn = 0;
+// What the screen writes is gathered and written at once, when the loop is about to wait: a frame
+// of the bottom block is many small pieces, and a console shows each write as it comes.
+static char pend[1 << 16];
+static size_t pend_n;
+static int pend_fd;
+
+static void flush_out(void) {
+    if (pend_n) { if (pend_fd == 1) out(pend, pend_n); else err(pend, pend_n); }
+    pend_n = 0;
 }
 
-// Take the typed line or the waiting line off the screen, so output can go where it was.
-static void clear_line(void) {
-    if (ed.shown) { ed_hide(&ed); ed_flush(); }
-    if (spin_shown) { errz("\r\033[K"); spin_shown = 0; }
+static void sc_write(void* ctx, int fd, const char* s, size_t n) {
+    (void)ctx;
+    if (fd != pend_fd || pend_n + n > sizeof pend) { flush_out(); pend_fd = fd; }
+    if (n > sizeof pend) { if (fd == 1) out(s, n); else err(s, n); return; }
+    memcpy(pend + pend_n, s, n);
+    pend_n += n;
 }
 
-static void ed_draw(void) {
-    if (!interactive || awaiting || !stdin_open || done) return;
-    if (agent_busy(agent) && ed.n == 0) return;   // no prompt while it works, unless you are typing
-    if (ed.shown) return;
-    if (spin_shown) clear_line();
-    ed_show(&ed);
-    ed_flush();
+// A time in ops_now_ms's units, as the wall clock will show it.
+static void sc_clock(void* ctx, int64_t at, char* hhmm) {
+    (void)ctx;
+    time_t t = time(0) + (time_t)((at - ops_now_ms()) / 1000);
+    struct tm lt;
+    hhmm[0] = 0;
+    if (!localtime_s(&lt, &t)) strftime(hhmm, 16, "%H:%M", &lt);
 }
 
-static void spin_draw(void) {
-    if (!http_id || !tty_out || awaiting || ed.shown) return;
-    int64_t secs = (ops_now_ms() - http_since) / 1000;
-    if (secs < 2 || (spin_shown && secs == spin_secs)) return;
-    char b[96];
-    snprintf(b, sizeof b, "\r\033[K\033[2m  waiting for the model, %llds (Ctrl-C stops it)\033[0m", (long long)secs);
-    errz(b);
-    spin_shown = 1;
-    spin_secs = secs;
+static int console_width(void) {
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    return con_err && GetConsoleScreenBufferInfo(h_err, &info) ? info.dwSize.X : 80;
 }
 
-static const char* color(int style) {
-    if (!tty_out) return "";
-    switch (style) {
-    case SAY_TOOL: return "\033[36m";
-    case SAY_INFO: return "\033[2m";
-    case SAY_ERROR: return "\033[31m";
-    }
-    return "";
-}
-
-static void show(int style, str_t s) {
-    clear_line();
-    if (style == SAY_ASSISTANT) {
-        out(s.p, s.n);
-        out("\n", 1);
-        return;
-    }
-    const char* on = color(style);
-    errz(on);
-    if (style == SAY_TOOL && s.n && s.p[0] != ' ') errz("> ");   // a tool's name line
-    err(s.p, s.n);
-    errz(*on ? "\033[0m\n" : "\n");
+static void draw(void) {
+    int prompt_ok = interactive && !awaiting && stdin_open && !done;
+    sc_draw(&scr, ops_now_ms(), agent_busy(agent), prompt_ok, !awaiting && !done);
 }
 
 // ---- the keyboard ----
 
-static void answer(int ans, const char* word) {
+static void answer(int ans) {
     int64_t id = awaiting;
     awaiting = 0;
-    errz(word);
-    errz("\n");
+    sc_answer(&scr, ans);
     deliver_simple(EV_ANSWER, id, ans, 0);
 }
 
@@ -236,10 +216,8 @@ static int more_text_waiting(void) {
 }
 
 static void enter(void) {
-    if (!ed.shown) { if (spin_shown) clear_line(); ed_show(&ed); ed_flush(); }
     int n;
-    const char* line = ed_take(&ed, &n);
-    ed_flush();
+    const char* line = sc_take(&scr, &n);
     if (more_text_waiting() && paste_add(line, (size_t)n) && paste_add("\n", 1)) return;
     if (!paste_n) { deliver_simple(EV_INPUT, 0, 0, line); return; }
     if (n) paste_add(line, (size_t)n);
@@ -251,37 +229,34 @@ static void enter(void) {
 static void key(uint32_t ch, WORD vk, int ctrl) {
     if (awaiting) {   // one key answers; the line being typed waits
         switch (ch) {
-        case 'y': case 'Y': answer(ANS_YES, "yes"); break;
-        case 'a': case 'A': answer(ANS_ALWAYS, "always"); break;
-        case 'n': case 'N': case '\r': case '\n': case 27: case 4: answer(ANS_NO, "no"); break;
+        case 'y': case 'Y': answer(ANS_YES); break;
+        case 'a': case 'A': answer(ANS_ALWAYS); break;
+        case 'n': case 'N': case '\r': case '\n': case 27: case 4: answer(ANS_NO); break;
         case 3: deliver_simple(EV_INTERRUPT, 0, 0, 0); break;
         }
         return;
     }
     if (!ch) {
         switch (vk) {
-        case VK_LEFT: ed_key(&ed, ctrl ? EK_WORD_LEFT : EK_LEFT, 0); break;
-        case VK_RIGHT: ed_key(&ed, ctrl ? EK_WORD_RIGHT : EK_RIGHT, 0); break;
-        case VK_HOME: ed_key(&ed, EK_HOME, 0); break;
-        case VK_END: ed_key(&ed, EK_END, 0); break;
-        case VK_DELETE: ed_key(&ed, EK_DEL, 0); break;
-        case VK_UP: ed_key(&ed, EK_UP, 0); break;
-        case VK_DOWN: ed_key(&ed, EK_DOWN, 0); break;
-        default: return;
+        case VK_LEFT: sc_key(&scr, ctrl ? EK_WORD_LEFT : EK_LEFT, 0); break;
+        case VK_RIGHT: sc_key(&scr, ctrl ? EK_WORD_RIGHT : EK_RIGHT, 0); break;
+        case VK_HOME: sc_key(&scr, EK_HOME, 0); break;
+        case VK_END: sc_key(&scr, EK_END, 0); break;
+        case VK_DELETE: sc_key(&scr, EK_DEL, 0); break;
+        case VK_UP: sc_key(&scr, EK_UP, 0); break;
+        case VK_DOWN: sc_key(&scr, EK_DOWN, 0); break;
         }
-        ed_flush();
         return;
     }
     int k = -1;
     switch (ch) {
     case 3:   // Ctrl-C: stop the work; at an idle prompt, throw away what was typed first
-        if (!agent_busy(agent) && ed.n) { ed_key(&ed, EK_CLEAR, 0); ed_flush(); }
+        if (!agent_busy(agent) && scr.ed.n) sc_key(&scr, EK_CLEAR, 0);
         else deliver_simple(EV_INTERRUPT, 0, 0, 0);
         return;
     case 4:   // Ctrl-D: on an empty line, the end; otherwise delete forward, as in a shell
-        if (ed.n) { k = EK_DEL; break; }
-        clear_line();
-        errz("\n");
+        if (scr.ed.n) { k = EK_DEL; break; }
+        sc_hide(&scr);
         stdin_open = 0;
         deliver_simple(EV_EOF, 0, 0, 0);
         return;
@@ -299,9 +274,8 @@ static void key(uint32_t ch, WORD vk, int ctrl) {
     case 14: k = EK_DOWN; break;            // Ctrl-N
     case 27: k = EK_CLEAR; break;           // Escape
     }
-    if (k >= 0) ed_key(&ed, k, 0);
-    else ed_key(&ed, EK_CHAR, ch);
-    ed_flush();
+    if (k >= 0) sc_key(&scr, k, 0);
+    else sc_key(&scr, EK_CHAR, ch);
 }
 
 static WCHAR high_surrogate;
@@ -309,12 +283,8 @@ static uint32_t last_ch;
 
 static void console_record(const INPUT_RECORD* r) {
     if (r->EventType == WINDOW_BUFFER_SIZE_EVENT) {
-        CONSOLE_SCREEN_BUFFER_INFO info;
-        if (GetConsoleScreenBufferInfo(h_err, &info)) {
-            int shown = ed.shown;
-            if (shown) { ed_hide(&ed); ed_flush(); }   // best effort: the old layout is gone either way
-            ed_set_width(&ed, info.dwSize.X);
-        }
+        int w = console_width();
+        if (w != scr.cfg.width) sc_resize(&scr, w);
         return;
     }
     if (r->EventType != KEY_EVENT) return;
@@ -431,40 +401,32 @@ static void read_lines(void) {
 
 // ---- carrying out actions ----
 
+static const char not_allowed[] =
+    "(not allowed: there is no one to ask. Run with --yes to let barb write files and run commands unasked.)";
+
 static void ask(const act_t* a) {
     if (oneshot || !interactive) {
-        clear_line();
-        char b[200];
-        snprintf(b, sizeof b, "%s(not allowed: there is no one to ask. Run with --yes to let barb write files and run commands unasked.)%s\n",
-                 color(SAY_ERROR), tty_out ? "\033[0m" : "");
-        errz(b);
+        sc_say(&scr, SAY_ERROR, not_allowed, sizeof not_allowed - 1);
         deliver_simple(EV_ANSWER, a->id, ANS_NO, 0);
         return;
     }
-    clear_line();
     read_console();   // keys typed before the question go to the line, so they cannot answer it
-    clear_line();
-    errz("\n");
-    errz(color(SAY_TOOL));
-    err(a->a.p, a->a.n);
-    errz(" wants to:");
-    errz(tty_out ? "\033[0m\n" : "\n");
-    err(a->b.p, a->b.n);
-    errz("\nAllow? [y]es / [n]o / [a]lways this session: ");
+    sc_question(&scr, a->a.p, a->a.n, a->b.p, a->b.n);
     awaiting = a->id;
 }
 
+// Every action is shown to the screen first (ACT_SAY is only that), then carried out.
 static void exec(const act_t* a) {
+    sc_action(&scr, a, ops_now_ms());
     switch (a->kind) {
-    case ACT_SAY: show(a->flag, a->a); break;
-    case ACT_HTTP: ops_http(a->id, a->a, a->b); http_id = a->id; http_since = ops_now_ms(); break;
+    case ACT_SAY: break;
+    case ACT_HTTP: ops_http(a->id, a->a, a->b); break;
     case ACT_READ: ops_read(a->id, a->a); break;
     case ACT_WRITE: ops_write(a->id, a->a, a->b); break;
     case ACT_SPAWN: ops_spawn(a->id, a->a, a->n, a->flag, a->c); break;
     case ACT_TIMER: ops_timer(a->id, a->n); break;
     case ACT_CANCEL:
-        if (a->id == http_id) { http_id = 0; clear_line(); }
-        if (a->id == awaiting) { awaiting = 0; errz("\n"); }
+        if (a->id == awaiting) { awaiting = 0; sc_hide(&scr); }
         else ops_cancel(a->id);
         break;
     case ACT_ASK: ask(a); break;
@@ -473,7 +435,7 @@ static void exec(const act_t* a) {
 }
 
 static void step(const ev_t* ev) {
-    if (ev->kind == EV_HTTP && ev->id == http_id) { http_id = 0; if (spin_shown) clear_line(); }
+    sc_event(&scr, ev);
     size_t n;
     const act_t* acts = agent_step(agent, ev, &n);
     for (size_t i = 0; i < n; i++) exec(&acts[i]);
@@ -521,8 +483,8 @@ static void loop(void) {
         take_signals();
         drain_queue();
         if (done) return;
-        ed_draw();
-        spin_draw();
+        draw();
+        flush_out();
         int n = 0, slot_console = -1, slot_lines = -1;
         h[n++] = wake;
         if (stdin_open && !oneshot) {
@@ -530,8 +492,8 @@ static void loop(void) {
             else if (in_ready) { slot_lines = n; h[n++] = in_ready; }
         }
         n += ops_handles((void**)(h + n), MAXIMUM_WAIT_OBJECTS - n);
-        int timeout = ops_timeout_ms();
-        if (http_id && tty_out && (timeout < 0 || timeout > 250)) timeout = 250;   // keep the clock moving
+        int timeout = ops_timeout_ms(), anim = sc_next_ms(&scr, ops_now_ms());   // the spinner's next frame
+        if (anim >= 0 && (timeout < 0 || timeout > anim)) timeout = anim;
         if (qhead) timeout = 0;
         DWORD r = WaitForMultipleObjects((DWORD)n, h, FALSE, timeout < 0 ? INFINITE : (DWORD)timeout);
         (void)r;
@@ -637,7 +599,8 @@ static int cleanup_started;
 static void cleanup(void) {
     if (cleanup_started) return;
     cleanup_started = 1;
-    clear_line();
+    sc_hide(&scr);
+    flush_out();
     ops_shutdown();
     if (restore_in) SetConsoleMode(h_in, mode_in);
     if (restore_out) SetConsoleMode(h_out, mode_out);
@@ -734,10 +697,24 @@ int wmain(int argc, wchar_t** wargv) {
         DWORD raw = (mode_in & ~(DWORD)(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT)) | ENABLE_WINDOW_INPUT;
         if (SetConsoleMode(h_in, raw)) { restore_in = 1; interactive = 1; }
     }
-    if (interactive) {
-        CONSOLE_SCREEN_BUFFER_INFO info;
-        ed_init(&ed, GetConsoleScreenBufferInfo(h_err, &info) ? info.dwSize.X : 80);
-    }
+    // The screen: the whole bottom block for an interactive session, a status line on a console
+    // that is not ours to edit, plain text for pipes and files. Windows Terminal's fonts have
+    // the braille for the spinner; the old console's may not.
+    char* home = env_utf8(L"USERPROFILE");
+    sc_cfg_t sc;
+    memset(&sc, 0, sizeof sc);
+    sc.mode = interactive ? SC_REGION : tty_out ? SC_LITE : SC_PIPE;
+    sc.vt_out = con_out && restore_out;
+    sc.vt_err = tty_out;
+    sc.fancy = GetEnvironmentVariableW(L"WT_SESSION", 0, 0) > 0 || GetEnvironmentVariableW(L"TERM_PROGRAM", 0, 0) > 0;
+    sc.width = console_width();
+    sc.model = model;
+    sc.cwd = cwd ? cwd : ".";
+    sc.home = home;
+    sc.write = sc_write;
+    sc.clock = sc_clock;
+    sc_init(&scr, &sc);
+    free(home);
 
     wake = CreateEventW(0, FALSE, FALSE, 0);
     cleaned = CreateEventW(0, TRUE, FALSE, 0);
@@ -771,13 +748,11 @@ int wmain(int argc, wchar_t** wargv) {
         } else if (!interactive) {
             stdin_open = 0;
         }
-        char b[600];
-        snprintf(b, sizeof b, "barb %s, model %s, in %s\n/help for commands; Ctrl-D to exit.\n", VERSION, model, cwd ? cwd : ".");
-        errz(b);
+        sc_banner(&scr, VERSION);
         if (!ops_shell()) {
-            snprintf(b, sizeof b, "%sbarb: Git Bash was not found, so commands cannot run. Install Git for Windows, or set BARB_SHELL to a bash.exe.%s\n",
-                     color(SAY_ERROR), tty_out ? "\033[0m" : "");
-            errz(b);
+            static const char no_bash[] =
+                "barb: Git Bash was not found, so commands cannot run. Install Git for Windows, or set BARB_SHELL to a bash.exe.";
+            sc_say(&scr, SAY_ERROR, no_bash, sizeof no_bash - 1);
         }
         if (!stdin_open) deliver_simple(EV_EOF, 0, 0, 0);
     } else {

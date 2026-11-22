@@ -8,109 +8,7 @@
 #include "check.h"
 #include "../src/ui/edit.h"
 
-// ---- a terminal ----
-
-#define TR 160
-#define TC 40
-#define CELL 24
-
-typedef struct {
-    char cell[TR][TC][CELL];   // the UTF-8 in each cell: "" is empty, "\x01" the right half of a wide character
-    int r, c;                  // the cursor
-    int pend;                  // waiting to wrap with the next character (the deferred kind)
-    int width, deferred;
-    int lr, lc;                // the cell last written, where a combining mark goes
-    int bad;                   // sequences this terminal does not know, or a cursor sent off the screen
-} term_t;
-
-static uint32_t utf8(const char* s, int n, int* len) {
-    const unsigned char* u = (const unsigned char*)s;
-    if (u[0] < 0x80) { *len = 1; return u[0]; }
-    if ((u[0] & 0xE0) == 0xC0 && n >= 2) { *len = 2; return ((uint32_t)(u[0] & 0x1F) << 6) | (u[1] & 0x3F); }
-    if ((u[0] & 0xF0) == 0xE0 && n >= 3) { *len = 3; return ((uint32_t)(u[0] & 0x0F) << 12) | ((uint32_t)(u[1] & 0x3F) << 6) | (u[2] & 0x3F); }
-    if ((u[0] & 0xF8) == 0xF0 && n >= 4) { *len = 4; return ((uint32_t)(u[0] & 0x07) << 18) | ((uint32_t)(u[1] & 0x3F) << 12) | ((uint32_t)(u[2] & 0x3F) << 6) | (u[3] & 0x3F); }
-    *len = 1;
-    return 0xFFFD;
-}
-
-static void t_init(term_t* t, int width, int deferred) {
-    memset(t, 0, sizeof *t);
-    t->width = width;
-    t->deferred = deferred;
-    t->lr = t->lc = -1;
-}
-
-static void t_erase(term_t* t, int r, int c) {   // from (r, c) to the end of the screen
-    for (; r < TR; r++) {
-        for (; c < TC; c++) t->cell[r][c][0] = 0;
-        c = 0;
-    }
-}
-
-static void t_put(term_t* t, uint32_t cp, const char* b, int len) {
-    int w = ed_cols(cp);
-    if (w == 0) {
-        if (t->lr >= 0 && strlen(t->cell[t->lr][t->lc]) + (size_t)len < CELL)
-            strncat(t->cell[t->lr][t->lc], b, (size_t)len);
-        return;
-    }
-    if (t->pend) { t->r++; t->c = 0; t->pend = 0; }
-    if (t->c + w > t->width) { t->r++; t->c = 0; }
-    if (t->r >= TR) { t->bad++; t->r = TR - 1; return; }
-    memcpy(t->cell[t->r][t->c], b, (size_t)len);
-    t->cell[t->r][t->c][len] = 0;
-    if (w == 2) strcpy(t->cell[t->r][t->c + 1], "\x01");
-    t->lr = t->r;
-    t->lc = t->c;
-    t->c += w;
-    if (t->c >= t->width) {
-        if (t->deferred) { t->c = t->width - 1; t->pend = 1; }
-        else { t->r++; t->c = 0; }
-    }
-}
-
-static void t_feed(term_t* t, const char* s, int n) {
-    for (int i = 0; i < n;) {
-        unsigned char ch = (unsigned char)s[i];
-        if (ch == 0x1B) {
-            if (i + 1 >= n || s[i + 1] != '[') { t->bad++; i++; continue; }
-            int j = i + 2, num = 0, has = 0;
-            while (j < n && s[j] >= '0' && s[j] <= '9') { num = num * 10 + (s[j] - '0'); has = 1; j++; }
-            if (j >= n) { t->bad++; return; }
-            char f = s[j];
-            i = j + 1;
-            switch (f) {
-            case 'A': t->r -= has ? num : 1; if (t->r < 0) { t->bad++; t->r = 0; } t->pend = 0; break;
-            case 'C': t->c += has ? num : 1; if (t->c > t->width - 1) t->c = t->width - 1; t->pend = 0; break;
-            case 'J': if (num) t->bad++; else t_erase(t, t->r, t->c); break;
-            default: t->bad++;
-            }
-            continue;
-        }
-        if (ch == '\r') { t->c = 0; t->pend = 0; i++; continue; }
-        if (ch == '\n') { t->r++; t->pend = 0; i++; continue; }
-        if (ch < 0x20 || ch == 0x7F) { t->bad++; i++; continue; }
-        int len;
-        uint32_t cp = utf8(s + i, n - i, &len);
-        t_put(t, cp, s + i, len);
-        i += len;
-    }
-}
-
-// A row as text, without the spaces at its end.
-static void t_row(const term_t* t, int r, char* b) {
-    int k = 0;
-    for (int c = 0; c < TC; c++) {
-        const char* x = t->cell[r][c];
-        if (!strcmp(x, "\x01")) continue;
-        if (!*x) { b[k++] = ' '; continue; }
-        size_t l = strlen(x);
-        memcpy(b + k, x, l);
-        k += (int)l;
-    }
-    while (k && b[k - 1] == ' ') k--;
-    b[k] = 0;
-}
+#include "term.h"
 
 // ---- what the screen should show ----
 
@@ -120,13 +18,17 @@ typedef struct {
     int cr, cc;                // where the cursor should be, from the prompt's row
 } layout_t;
 
+// The prompt as it shows (the editor's, without its colours) and its columns.
+static char prompt_text[64] = "> ";
+static int prompt_cols = 2;
+
 // Worked out independently of the editor: the prompt, then each character on the row it fits
 // in, a row filled to the last column putting the cursor at the start of the next.
 static void layout(layout_t* L, const char* line, int n, int cur, int width) {
     memset(L, 0, sizeof *L);
-    int r = 0, c = 2, k = 2;
-    strcpy(L->rows[0], "> ");
-    L->cr = 0; L->cc = 2;
+    int r = 0, c = prompt_cols, k = (int)strlen(prompt_text);
+    strcpy(L->rows[0], prompt_text);
+    L->cr = 0; L->cc = prompt_cols;
     for (int i = 0; i < n;) {
         int len;
         uint32_t cp = utf8(line + i, n - i, &len);
@@ -178,13 +80,45 @@ static void start(int width, int deferred) {
     t_feed(&T, "above\r\n", 7);
     top = 1;
     ed_init(&E, width);
+    strcpy(prompt_text, "> ");
+    prompt_cols = 2;
     ed_show(&E);
     apply();
 }
 
-// The screen shows exactly the prompt and the line, with the cursor in place; or, hidden, nothing.
+// What a decoration row should show: escapes gone, control characters as spaces, cut to leave
+// the last column free, without the spaces at its end.
+static void decor_text(const char* s, int width, char* b) {
+    int k = 0, cols = 0;
+    for (int n = (int)strlen(s), i = 0; i < n;) {
+        if (s[i] == 0x1B) {
+            if (i + 1 < n && s[i + 1] == '[') {
+                i += 2;
+                while (i < n && !((unsigned char)s[i] >= 0x40 && (unsigned char)s[i] <= 0x7E)) i++;
+                i++;
+            } else {
+                i += 2;
+            }
+            continue;
+        }
+        int len;
+        uint32_t cp = utf8(s + i, n - i, &len);
+        int ctl = cp < 0x20 || cp == 0x7F;
+        int w = ctl ? 1 : ed_cols(cp);
+        if (cols + w > width - 1) break;
+        if (ctl) b[k++] = ' ';
+        else { memcpy(b + k, s + i, (size_t)len); k += len; }
+        cols += w;
+        i += len;
+    }
+    while (k && b[k - 1] == ' ') k--;
+    b[k] = 0;
+}
+
+// The screen shows exactly the block: the decoration rows, the prompt and the line, the footer,
+// with the cursor in place; or, hidden, nothing.
 static void check_screen(const char* when) {
-    char got[TC * CELL + 1];
+    char got[TC * CELL + 1], want[TC * CELL + 1];
     checks_run++;
     step_failed = 0;
     if (T.bad) { fail("the terminal was sent something wrong", when); T.bad = 0; return; }
@@ -198,9 +132,23 @@ static void check_screen(const char* when) {
         if (T.r != top || T.c != 0 || T.pend) fail("hidden, the cursor is not where the prompt was", when);
         return;
     }
-    layout(&L, E.line, E.n, E.cur, T.width);
-    for (int i = 0; i < L.n; i++) {
+    int na = E.nabove;
+    for (int i = 0; i < na; i++) {
         t_row(&T, top + i, got);
+        decor_text(E.above[i], T.width, want);
+        if (strcmp(got, want)) {
+            char d[TC * CELL * 2 + 64];
+            snprintf(d, sizeof d, "%s: decoration row %d is \"%s\", should be \"%s\"", when, i, got, want);
+            fail("the screen does not show the decoration", d);
+            return;
+        }
+    }
+    layout(&L, E.line, E.n, E.n, T.width);
+    int end_row = L.cr;                // the line's end, on the row after a full one
+    layout(&L, E.line, E.n, E.cur, T.width);
+    int line0 = top + na;
+    for (int i = 0; i < L.n; i++) {
+        t_row(&T, line0 + i, got);
         if (strcmp(got, L.rows[i])) {
             char d[TC * CELL * 2 + 64];
             snprintf(d, sizeof d, "%s: row %d is \"%s\", should be \"%s\"", when, i, got, L.rows[i]);
@@ -208,18 +156,29 @@ static void check_screen(const char* when) {
             return;
         }
     }
-    for (int r = top + L.n; r < TR; r++) {
+    int foot = E.has_below ? line0 + end_row + 1 : -1;
+    for (int r = line0 + L.n; r < TR; r++) {
         t_row(&T, r, got);
+        if (r == foot) {
+            decor_text(E.below, T.width, want);
+            if (strcmp(got, want)) {
+                char d[TC * CELL * 2 + 64];
+                snprintf(d, sizeof d, "%s: the footer is \"%s\", should be \"%s\"", when, got, want);
+                fail("the screen does not show the footer", d);
+                return;
+            }
+            continue;
+        }
         if (*got) { fail("something is left below the line", when); return; }
     }
-    if (T.pend || T.r != top + L.cr || T.c != L.cc) {
+    if (T.pend || T.r != line0 + L.cr || T.c != L.cc) {
         char d[200];
-        snprintf(d, sizeof d, "%s: at row %d col %d%s, should be row %d col %d", when, T.r - top, T.c,
+        snprintf(d, sizeof d, "%s: at row %d col %d%s, should be row %d col %d", when, T.r - line0, T.c,
                  T.pend ? " waiting to wrap" : "", L.cr, L.cc);
         fail("the cursor is in the wrong place", d);
         return;
     }
-    if (E.row != L.cr) fail("the editor lost track of the cursor's row", when);
+    if (E.row != na + L.cr) fail("the editor lost track of the cursor's row", when);
 }
 
 static void check_line(const char* want) { CHECK_INT(strcmp(E.line, want), 0); if (strcmp(E.line, want)) printf("  line \"%s\", want \"%s\"\n", E.line, want); }
@@ -498,6 +457,153 @@ static void test_limits(void) {
     CHECK(E2.outn < (int)sizeof E2.out);
 }
 
+static void refresh(void) { ed_refresh(&E); apply(); }
+static void set_prompt(const char* s, const char* shows, int cols) {
+    ed_set_prompt(&E, s, cols);
+    strcpy(prompt_text, shows);
+    prompt_cols = cols;
+}
+
+static void test_decoration(int deferred) {
+    start(20, deferred);
+    ed_frame(&E, 2, 1); apply();
+    check_screen("an empty frame");
+    ed_set_above(&E, 0, "\033[2m\xe2\xa0\x8b waiting \xc2\xb7 3s\033[0m");
+    ed_set_above(&E, 1, "\033[2m\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80"
+                        "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80"
+                        "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\033[0m");
+    ed_set_below(&E, "\033[2mmodel \xc2\xb7 ~/x\033[0m");
+    refresh();
+    check_screen("decorated");
+    CHECK_INT(E.above_cols[1], 19);    // a rule wider than the row is cut to leave the last column
+    refresh();
+    CHECK_INT(E.outn, 0);              // nothing changed, nothing drawn
+    ed_set_above(&E, 0, E.above[0]);
+    refresh();
+    CHECK_INT(E.outn, 0);              // the same text again changes nothing
+    type("hello");
+    check_screen("typing above a footer");
+    ed_set_above(&E, 0, "\033[2m\xe2\xa0\x99 waiting \xc2\xb7 4s\033[0m");
+    refresh();
+    check_screen("the activity row changed");
+    CHECK(!memchr(E.out, 'J', (size_t)E.outn));   // rewritten in place: the line was not erased
+    key(EK_HOME, 0);
+    ed_set_above(&E, 1, "short");      // shorter than before: the rest of the row is cleared
+    refresh();
+    check_screen("a shorter decoration row, cursor at home");
+    key(EK_END, 0);
+    type("abcdefghijklm");             // 2 + 18: exactly full, the footer two rows down
+    check_screen("a full row above a footer");
+    CHECK_INT(E.row, 3);
+    type("n");
+    check_screen("onto the row after a full one");
+    key(EK_BACK, 0);
+    key(EK_BACK, 0);
+    check_screen("back off the full row");
+    ed_set_below(&E, "a\tb\x01" "c \xe6\xbc\xa2\xe6\xbc\xa2\xe6\xbc\xa2\xe6\xbc\xa2\xe6\xbc\xa2\xe6\xbc\xa2\xe6\xbc\xa2\xe6\xbc\xa2");
+    refresh();
+    check_screen("a footer with control and wide characters, too long");
+    ed_set_below(&E, "");
+    refresh();
+    check_screen("an empty footer");
+
+    set_prompt("\033[1;35m>\033[0m ", "> ", 2);
+    refresh();
+    check_screen("a coloured prompt");
+    set_prompt("barb> ", "barb> ", 6);
+    refresh();
+    check_screen("a wider prompt");
+    type("xyz");
+    check_screen("typing after a wider prompt");
+    ed_set_prompt(&E, "> ", -1); CHECK_INT(E.prompt_cols, 2);
+    ed_set_prompt(&E, "> ", 21); CHECK_INT(E.prompt_cols, 2);
+    set_prompt("> ", "> ", 2);
+    refresh();
+    check_screen("the prompt back");
+
+    ed_set_above(&E, -1, "x");         // out of range: ignored
+    ed_set_above(&E, ED_ABOVE, "x");
+    refresh();
+    CHECK_INT(E.outn, 0);
+
+    ed_hide(&E); apply();
+    check_screen("decorated, hidden");
+    ed_set_above(&E, 0, "while hidden");
+    refresh();
+    CHECK_INT(E.outn, 0);              // nothing drawn while hidden
+    ed_show(&E); apply();
+    check_screen("shown with what changed while hidden");
+
+    ed_frame(&E, 1, 0); apply();
+    check_screen("one row above, no footer");
+    ed_frame(&E, 1, 0);
+    CHECK_INT(E.outn, 0);
+    ed_frame(&E, 9, 9); apply();
+    CHECK_INT(E.nabove, ED_ABOVE);
+    CHECK_INT(E.has_below, 1);
+    check_screen("the frame clamped");
+    ed_frame(&E, -3, 0); apply();
+    CHECK_INT(E.nabove, 0);
+    check_screen("no frame");
+    ed_frame(&E, 2, 1); apply();
+    check_screen("the frame again");
+
+    // Enter: the decoration goes and the prompt and line stay, as a record of what was sent.
+    key(EK_HOME, 0);
+    const char* s = enter();
+    CHECK_INT(strcmp(s, "helloabcdefghijklxyz"), 0);
+    char got[TC * CELL + 1];
+    t_row(&T, 1, got);
+    CHECK_INT(strcmp(got, "> helloabcdefghijklx"), 0);
+    t_row(&T, 2, got);
+    CHECK_INT(strcmp(got, "yz"), 0);
+    ed_show(&E); apply();
+    check_screen("a decorated prompt after Enter");
+    type("abcdefghijklmnopqr");        // full at Enter, decoration and all
+    enter();
+    ed_show(&E); apply();
+    check_screen("after Enter on a full row");
+
+    // A resize erases the block as the terminal has reflowed it: a decoration row wider than the
+    // new width takes two rows.
+    start(40, deferred);
+    ed_frame(&E, 2, 1); apply();
+    ed_set_above(&E, 0, "012345678901234567890123456789");
+    ed_set_above(&E, 1, "short");
+    refresh();
+    type("hello");
+    CHECK_INT(E.row, 2);
+    ed_resize(&E, 40);                 // the same width: erased from where it is
+    CHECK_INT(E.outn, 8);
+    CHECK_INT(memcmp(E.out, "\033[2A\r\033[J", 8), 0);
+    apply();
+    check_screen("erased for a resize");
+    ed_show(&E); apply();
+    ed_resize(&E, 20);
+    CHECK_INT(E.outn, 8);
+    CHECK_INT(memcmp(E.out, "\033[3A\r\033[J", 8), 0);
+    CHECK_INT(E.shown, 0);
+    CHECK_INT(E.width, 20);
+    ed_resize(&E, 3);
+    CHECK_INT(E.width, 10);
+
+    // Text too long for its row is cut between whole characters.
+    static char big[ED_DECOR * 2];
+    for (int i = 0; i + 1 < (int)sizeof big; i += 2) memcpy(big + i, "\xc3\xa9", 2);
+    big[sizeof big - 1] = 0;
+    ed_set_below(&E, big);
+    CHECK_INT((int)strlen(E.below), ED_DECOR - 2);
+    CHECK_INT((unsigned char)E.below[ED_DECOR - 3], 0xA9);
+    ed_set_prompt(&E, big, 2);
+    CHECK_INT((int)strlen(E.prompt) % 2, 0);
+    ed_set_below(&E, NULL);
+    CHECK_INT(E.below[0], 0);
+
+    CHECK_INT(ed_text_cols("\033[1mab\033[0m\xe6\xbc\xa2", 13), 4);
+    CHECK_INT(ed_text_cols("\033" "7x", 3), 1);
+    CHECK_INT(ed_text_cols("\033[1", 3), 0);
+}
+
 // ---- a random run ----
 
 static uint32_t seed = 12345;
@@ -515,13 +621,35 @@ static int valid(const ed_t* e) {
     return 1;
 }
 
-static void test_random(int deferred, int width) {
+// With `deco`, the decoration changes now and then too: its rows, the footer, the prompt and
+// how many rows there are.
+static void test_random(int deferred, int width, int deco) {
     static const uint32_t chars[] = { 'a', 'b', 'x', ' ', ' ', 0xE9, 0x4E00, 0x1F600, 0x301, '-' };
+    static const char* texts[] = {
+        "", "x", "\033[2m\xe2\xa0\x8b waiting \xc2\xb7 12s\033[0m", "a much longer line than any terminal here",
+        "\xe6\xbc\xa2\xe6\xbc\xa2\xe6\xbc\xa2\xe6\xbc\xa2\xe6\xbc\xa2\xe6\xbc\xa2\xe6\xbc\xa2", "\033[1;32m\xe2\x97\x8f\033[0m tab\there",
+    };
+    static const struct { const char *s, *shows; int cols; } prompts[] = {
+        { "> ", "> ", 2 }, { "\033[1;35m>\033[0m ", "> ", 2 }, { "barb> ", "barb> ", 6 },
+    };
     start(width, deferred);
+    if (deco) { ed_frame(&E, 2, 1); apply(); }
     for (int step = 0; step < 4000; step++) {
         int r = (int)rnd(100);
         const char* what;
-        if (r < 45) { what = "typing"; if (E.n < 90) key(EK_CHAR, chars[rnd((uint32_t)(sizeof chars / sizeof *chars))]); }
+        if (deco && rnd(8) == 0) {
+            int d = (int)rnd(10);
+            const char* t = texts[rnd((uint32_t)(sizeof texts / sizeof *texts))];
+            if (d < 4) { what = "a decoration row"; ed_set_above(&E, (int)rnd(ED_ABOVE), t); }
+            else if (d < 7) { what = "the footer"; ed_set_below(&E, t); }
+            else if (d < 8) {
+                what = "the prompt";
+                int p = (int)rnd(sizeof prompts / sizeof *prompts);
+                set_prompt(prompts[p].s, prompts[p].shows, prompts[p].cols);
+            }
+            else { what = "the frame"; ed_frame(&E, (int)rnd(ED_ABOVE + 1), (int)rnd(2)); apply(); }
+            refresh();
+        } else if (r < 45) { what = "typing"; if (E.n < 90) key(EK_CHAR, chars[rnd((uint32_t)(sizeof chars / sizeof *chars))]); }
         else if (r < 52) { what = "backspace"; key(EK_BACK, 0); }
         else if (r < 55) { what = "delete"; key(EK_DEL, 0); }
         else if (r < 63) { what = "left"; key(EK_LEFT, 0); }
@@ -557,7 +685,10 @@ int main(void) {
         test_unicode(deferred);
         test_hidden(deferred);
         test_enter_and_history(deferred);
-        for (int w = 10; w <= 14; w++) test_random(deferred, w);
+        test_decoration(deferred);
+        for (int w = 10; w <= 14; w++) test_random(deferred, w, 0);
+        for (int w = 10; w <= 14; w++) test_random(deferred, w, 1);
+        test_random(deferred, 23, 1);
     }
     test_moving_and_killing();
     test_limits();

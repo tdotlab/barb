@@ -48,6 +48,7 @@ typedef struct {
     char* says[256];
     int style[256];
     int nsays;
+    int64_t usage;             // n of the last SAY_USAGE
     char* bodies[64];
     int nbodies;
     op_t ops[MAXOPS];
@@ -200,6 +201,7 @@ static void w_act(world_t* w, const act_t* a) {
     switch (a->kind) {
     case ACT_SAY:
         if (w->nsays < 256) { w->says[w->nsays] = dupn(a->a.p ? a->a.p : "", a->a.n); w->style[w->nsays++] = a->flag; }
+        if (a->flag == SAY_USAGE) w->usage = a->n;
         break;
     case ACT_HTTP: {
         char* body = dupn(a->b.p, a->b.n);

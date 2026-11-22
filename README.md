@@ -30,7 +30,19 @@ like `-m deepseek/deepseek-chat` (it accepts the `x-api-key` header Barb sends; 
 
 In a session, `/clear` forgets the conversation, `/exit` or Ctrl-D quits, and Ctrl-C stops what
 is running (twice at the prompt quits); the model is told it was interrupted. Type while it works
-and your message is queued. While a reply is on its way, a line counts the seconds.
+and your message is queued.
+
+On a terminal the prompt sits in a small block at the bottom: a line above it says what is going
+on (a spinner while the model thinks or a command runs, with the seconds; the retry countdown after
+a failed request; the background tasks and wakeups it is idle on), a rule, the prompt, and a footer
+with the model, the directory, the tokens the conversation takes, and a hint for the key that
+matters now. The record scrolls above it: each tool call a line with its name in bold and its
+result hung under it, errors in red, questions with a diff's added and removed lines coloured. Replies
+are rendered from markdown: headings, bold, italics, code, links, lists, quotes, fenced code, rules,
+and tables (aligned, or a record per row when too wide), wrapped at words. Text from the model or a
+command is never sent to the terminal raw: its control characters are shown as `^[` and the like.
+In a locale that is not UTF-8, or on the Linux console, it all falls back to ASCII. When output is
+not a terminal, nothing changes: what scripts read is as it was.
 
 The prompt has its own line editor (`src/ui/edit.c`, on Linux, macOS and Windows): arrows,
 Home/End, Ctrl- or Alt-arrows by word, Backspace and Delete, the readline keys (Ctrl-A, E, B, F, K,
@@ -124,6 +136,10 @@ in its arguments. RingTail's shell holds 255 characters a line, so a long task g
   emulator in both of the console's wrapping modes, with a randomized run of keys;
 - `test_keys`: the decoder that turns a terminal's bytes into keys: escape sequences, UTF-8
   (overlong forms and other non-characters dropped), bracketed paste, and random bytes;
+- `test_md`: the markdown renderer, played on the emulator: every construct, wrapping with wide
+  characters, hostile bytes, and random input;
+- `test_screen`: the screen (the record, the activity line, the footer) in each of its three modes,
+  with both output streams played on the emulator and a randomized run of events, keys and resizes;
 - `tests/e2e.py`: the real binary against a fake API on localhost, including a pseudo-terminal
   session for the permission prompts, line editing, pastes, Ctrl-C and Ctrl-Z, timeouts, retries, and checks that the API key is
   never on a command line and never in the environment of a command the model runs.
@@ -158,5 +174,6 @@ Not tested: macOS, and sessions long enough to fill the context window.
 `src/core` is portable C (ISO C11, only `string.h`, `stddef.h` and `stdint.h`): the agent, the
 tools, the API layer, JSON, memory. `src/posix` is the Linux and macOS platform, `src/win32` is
 Windows', and `src/ringtail` is RingTail's, built in a RingTail checkout. `src/ui` is the line
-editor and the key decoder, as portable as the core and shared by POSIX and Windows. `tools` has the mutation runner and the copy to RingTail. `tests` has the
+editor, the key decoder, the markdown renderer and the screen, as portable as the core and shared
+by POSIX and Windows. `tools` has the mutation runner and the copy to RingTail. `tests` has the
 tests and a fake world. `docs/ARCHITECTURE.md` is the map; `TODO.md` is what comes next.

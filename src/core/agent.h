@@ -51,7 +51,8 @@ typedef struct {
 } ev_t;
 
 typedef enum {
-    ACT_SAY,      // flag: SAY_*, a: the text to show the user
+    ACT_SAY,      // flag: SAY_*, a: the text to show the user; for SAY_USAGE, n: the tokens the
+                  // conversation now takes (what the next request will send, roughly)
     ACT_HTTP,     // id, a: the path (/v1/messages), b: the JSON body. The platform adds the host and the credentials.
     ACT_READ,     // id, a: path. The whole file comes back in an EV_FILE (the platform sets a size limit).
     ACT_WRITE,    // id, a: path, b: the new contents. Make the parent directories; replace atomically.
@@ -62,7 +63,9 @@ typedef enum {
     ACT_DONE      // n: the exit status. The platform stops.
 } actk_t;
 
-enum { SAY_ASSISTANT, SAY_TOOL, SAY_INFO, SAY_ERROR };
+// SAY_USAGE is the token count after each reply: a platform with a status line can show it there
+// instead of printing it, and one without can treat it as SAY_INFO.
+enum { SAY_ASSISTANT, SAY_TOOL, SAY_INFO, SAY_ERROR, SAY_USAGE };
 
 typedef struct {
     actk_t kind;

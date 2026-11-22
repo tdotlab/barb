@@ -9,6 +9,8 @@ static void test_chat(void) {
     CHECK_INT(w->nbodies, 1);
     CHECK(w_said(w, "Hello there."));
     CHECK(w_said(w, "[tokens: 100 in, 20 out]"));
+    CHECK_INT(w->style[w->nsays - 1], SAY_USAGE);
+    CHECK_INT((int)w->usage, 120);
     CHECK(strstr(w->bodies[0], "You are Barb"));
     CHECK(strstr(w->bodies[0], "Working directory: /work"));
     CHECK(strstr(w->bodies[0], "\"name\":\"read_file\""));
@@ -18,6 +20,12 @@ static void test_chat(void) {
     free(t);
     CHECK_INT(w->nbodies, 1);        // nothing more is asked of the model: it is idle
     CHECK(!w->done);
+    w_reply(w, "{\"id\":\"m2\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],"
+               "\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":5,\"cache_creation_input_tokens\":7,"
+               "\"cache_read_input_tokens\":1000,\"output_tokens\":30}}", 200);
+    w_input(w, "again");
+    CHECK(w_said(w, "[tokens: 1012 in (1000 cached), 30 out]"));
+    CHECK_INT((int)w->usage, 1042);    // all of it is in the conversation the next request sends
     w_event(w, EV_EOF, 0, 0, 0, 0);
     CHECK(w->done && w->exit_code == 0);
     w_free(w);

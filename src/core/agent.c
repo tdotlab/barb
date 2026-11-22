@@ -530,7 +530,9 @@ static void on_http(agent_t* g, const ev_t* ev) {
         sb_putz(&b, ", ");
         sb_puti(&b, r.out_tok);
         sb_putz(&b, " out]");
-        say(g, SAY_INFO, sb_str(&b));
+        act_t* a = emit_op(g, ACT_SAY, sb_str(&b), str_of(0, 0), str_of(0, 0));
+        a->flag = SAY_USAGE;
+        a->n = r.in_tok + r.cache_read + r.cache_write + r.out_tok;
     }
     if (m->first) {
         m->next = 0;

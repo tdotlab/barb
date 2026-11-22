@@ -8,8 +8,8 @@ Read these before changing code:
 - `README.md`: what Barb does and how to run it.
 
 `make test` runs everything: the core's unit tests, the agent scenarios, a randomized
-chaos test and the tests of the line editor and the key decoder (all under the address and undefined-behaviour
-sanitizers), then the end-to-end test against a fake API. Run it before committing. It takes
+chaos test and the tests of `src/ui` (the line editor, the key decoder, the markdown renderer and
+the screen; all under the address and undefined-behaviour sanitizers), then the end-to-end test against a fake API. Run it before committing. It takes
 about half a minute. On Windows, `build.cmd test` is the same (MSVC, AddressSanitizer).
 
 The rules that keep this project what it is:

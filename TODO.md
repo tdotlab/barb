@@ -38,8 +38,14 @@ against DeepSeek from Windows (2026-11-22: found cl through vswhere, worked arou
 **The prompt, what is left.** Both prompts share `src/ui`'s editor now. A pasted line longer than
 the editor's 8,192 bytes is cut there, and each line of a paste goes into the history as its own
 entry, so Up after a paste walks back through its lines; a paste should be one entry, and its
-lines unlimited. Sonnet medium. This is the ground for a nicer interface (a status line, the
-waiting line drawn below the prompt instead of in its place).
+lines unlimited. Sonnet medium.
+
+**The screen, what is left.** `src/ui/screen.c` gives both prompts an activity line, a footer and a
+styled record, and replies are rendered as markdown. Still rough: markdown arrives a whole reply
+at a time (streaming would need the renderer fed line by line, which its design allows), and
+RingTail still has its own plainer display (its serial terminal takes the same escapes, so it
+could use `src/ui` too). Check
+it by eye on a real terminal or two (Windows Terminal, conhost, a Linux console). Sonnet medium.
 
 **Redundant wake-ups.** In that live run the model set timers to "check" a background task whose
 completion message had already woken it, which cost four extra model calls. The bash tool's
