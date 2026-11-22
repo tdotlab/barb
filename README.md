@@ -3,7 +3,7 @@
 A coding agent for the terminal, in C. You give it a task; it reads and edits files and runs
 commands in your working directory, asking before it changes anything. It is built the way
 RingTail's programs are: a core that does no I/O, tested on the host, and a thin layer for each
-platform. Linux and macOS work today. Windows and RingTail are next (see TODO.md).
+platform. It runs on Linux, on macOS (untested), and on RingTail. Windows is next (see TODO.md).
 
 Status: v0.2.0. It talks to the Anthropic Messages API (and anything that speaks it) and has six
 tools. It has done real work against a live model: multi-file bug fixes, a refactor across a
@@ -55,6 +55,24 @@ It retries overloaded and failed requests with growing delays, caches the system
 conversation so a long session pays for what is new, and keeps thinking blocks and any block type
 it does not know intact.
 
+## On RingTail
+
+`tools/to_ringtail.sh PATH/TO/RINGTAIL` copies the core and `src/ringtail` into that checkout's
+`vendor/barb`, and RingTail's `make` builds them into the program `barb` on its disk. RingTail
+programs have no environment, so the settings go in `/barb.cfg`:
+
+```
+key = sk-...
+url = https://api.anthropic.com
+model = claude-sonnet-5-5
+```
+
+Then `barb` at RingTail's shell works as it does on Linux: the same tools (bash runs saklas, RingTail's
+shell), the same sleeping on background tasks, the same keys. HTTP goes through RingTail's `fetch`
+(TLS 1.3, certificates checked against `/roots.pem`), with the key on fetch's standard input, never
+in its arguments. RingTail's shell holds 255 characters a line, so a long task goes in a file:
+`barb -p - < task.txt`. Its tests are in RingTail's QEMU suite (`barb_tests` in `qemu_test.py`).
+
 ## Tests
 
 `make test` runs, under the address and undefined-behaviour sanitizers (gcc):
@@ -93,5 +111,6 @@ every one from a point on and exactly one, and checks that a refusal always ends
 ## Layout
 
 `src/core` is portable C (ISO C11, only `string.h`, `stddef.h` and `stdint.h`): the agent, the
-tools, the API layer, JSON, memory. `src/posix` is the Linux and macOS platform. `tests` has the
+tools, the API layer, JSON, memory. `src/posix` is the Linux and macOS platform; `src/ringtail` is
+RingTail's, built in a RingTail checkout. `tools` has the mutation runner and the copy to RingTail. `tests` has the
 tests and a fake world. `docs/ARCHITECTURE.md` is the map; `TODO.md` is what comes next.

@@ -11,9 +11,10 @@ and the rules it keeps. When this map and a file disagree, the file is right; fi
          │   events                 actions  │   files, processes, HTTP, timers
          ▼                                   ▼
   ┌─────────────────────────┐        ┌───────────────────────┐
-  │ platform (src/posix)    │ ─ev──▶ │ core (src/core)       │
-  │ main.c  the poll loop   │ ◀─act─ │ agent.c  the state    │
-  │ ops.c   does the work   │        │          machine      │
+  │ platform (src/posix,    │ ─ev──▶ │ core (src/core)       │
+  │           src/ringtail) │ ◀─act─ │ agent.c  the state    │
+  │ main.c  the poll loop   │        │          machine      │
+  │ ops.c   does the work   │        │                       │
   └─────────────────────────┘        │ tools.c  the tools    │
                                      │ api.c    transcript,  │
                                      │          request,reply│
@@ -58,6 +59,8 @@ out-of-memory test tries it at every allocation point of a long scenario.
 | `src/core/tools.c` | the six tools and their definitions | `test_agent` |
 | `src/posix/ops.c` | processes, curl, files, timers | `tests/e2e.py` |
 | `src/posix/main.c` | arguments, poll loop, terminal | `tests/e2e.py` (pipes and a pseudo-terminal) |
+| `src/ringtail/ops.c` | the same on RingTail: `sh -c` as jobs, `fetch` for HTTP, whole-file reads and saves | RingTail's `qemu_test.py`, `barb_tests` |
+| `src/ringtail/main.c` | `/barb.cfg`, the raw-mode line editor, the loop | the same, at the terminal over serial |
 | `tests/harness.h` | a fake world (scripted model, in-memory files, scripted processes) | used by `test_agent` |
 | `tools/mutate.py` | breaks the code in listed ways and checks a test catches each | run by hand after changing the core |
 
@@ -113,6 +116,9 @@ number in `tc.phase`; keep what it needs between steps in `agent->ta`), and add 
 
 Implement the eight actions of `agent.h` (say, HTTP, read, write, spawn, timer, cancel, ask, done),
 turn their results into events, and never call the agent re-entrantly. `src/posix/ops.h` is the
-interface the POSIX version uses; it is a good template. The core wants a `mem_t`, the clock only
+interface the POSIX version uses; it is a good template, and `src/ringtail` shows how far the same
+shape stretches on a system with no fork, no environment and no SIGCHLD: commands are jobs stopped
+with `kill(-job)`, their end is found by asking whether the task is still there, and HTTP is a
+child program reading the key from a pipe. The core wants a `mem_t`, the clock only
 through timers the platform runs, and nothing else. Show the prompt only when `agent_busy()` is 0,
 and set `instructions` in the config unless the user turned it off.

@@ -35,12 +35,12 @@ and sent back intact. Sonnet medium.
 WinHTTP for HTTP, and the console. The core builds as is. Opus high, Codex Sol high: the process
 and signal semantics are where the quiet mistakes are.
 
-**RingTail.** The core needs a libc-free build (it already is: `string.h` only). The platform needs
-what RingTail lacks today: an HTTPS POST with headers and a body (`fetch` is GET-only; a small program
-or a `fetch -d`), a way to wait on several things at once (child exit, a timer, input), and file
-operations over its own system calls. Read `docs/ARCHITECTURE.md`, "Adding a platform". Sonnet high
-for `fetch -d`, Opus high for the platform. Later: MicroPython on RingTail, so the agent can run
-Python there.
+**RingTail, what is left.** Barb runs there (src/ringtail, tested in RingTail's QEMU suite, and
+it has done a live task). Still to do: a real HTTPS run from a RingTail machine to the API itself
+(the live run so far went through a plain-HTTP relay on the test host, because the cloud container
+reaches the internet only through a proxy QEMU's network cannot use); the waiting line and colours
+over serial are rough; and MicroPython on RingTail, so the agent can run Python there. Sonnet high
+for the HTTPS run, Opus high for MicroPython.
 
 ## Tests worth adding
 

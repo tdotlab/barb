@@ -204,7 +204,9 @@ static void test_permissions(void) {
 
 static void test_bash(void) {
     world_t* w = w_new(1);
-    w->nprocs = 5;
+    w->nprocs = 7;
+    w->procs[5] = (typeof(w->procs[5])){ "sleep 15", "", 0, PROC_TIMEDOUT };
+    w->procs[6] = (typeof(w->procs[6])){ "sleep 16", "", 0, PROC_TIMEDOUT };
     w->procs[0] = (typeof(w->procs[0])){ "echo", "hi\n", 0, 0 };
     w->procs[1] = (typeof(w->procs[1])){ "false", "", 1, 0 };
     w->procs[2] = (typeof(w->procs[2])){ "sleep 999", "partial", 0, PROC_TIMEDOUT };
@@ -215,12 +217,16 @@ static void test_bash(void) {
     w->procs[4] = (typeof(w->procs[4])){ "bigout", big, 0, 0 };
     w_reply_tools(w, TOOL("b1", "bash", J({"command":"echo hi"})) "," TOOL("b2", "bash", J({"command":"false"})) ","
                      TOOL("b3", "bash", J({"command":"sleep 999","timeout_ms":2000})) ","
-                     TOOL("b4", "bash", J({"command":"nonesuch"})) "," TOOL("b5", "bash", J({"command":"bigout"})));
+                     TOOL("b4", "bash", J({"command":"nonesuch"})) "," TOOL("b5", "bash", J({"command":"bigout"})) ","
+                     TOOL("b6", "bash", J({"command":"sleep 15","timeout_ms":1500})) ","
+                     TOOL("b7", "bash", J({"command":"sleep 16","timeout_ms":1000})));
     w_reply_text(w, "ok");
     w_input(w, "go");
     CHECK_RESULT(w, "b1", "hi\n[exit code: 0]");
     CHECK_RESULT(w, "b2", "(no output)\n[exit code: 1]");
-    CHECK_RESULT_HAS(w, "b3", "partial\n[killed: it ran longer than 2 seconds.");
+    CHECK_RESULT_HAS(w, "b3", "partial\n[killed: it ran longer than its limit of 2 seconds.");
+    CHECK_RESULT_HAS(w, "b6", "[killed: it ran longer than its limit of 1.5 seconds.");   // not "1 seconds"
+    CHECK_RESULT_HAS(w, "b7", "[killed: it ran longer than its limit of 1 second.");
     CHECK_RESULT_HAS(w, "b4", "The command could not be started: no such shell");
     CHECK_RESULT_HAS(w, "b5", "bytes omitted from the middle");
     char* r = w_result(w, "b5", 0);

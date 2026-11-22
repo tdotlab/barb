@@ -43,6 +43,10 @@ MUTATIONS = [
      "        ld_finish(g, 0);", *AGENT),
     ("load-every-turn", "src/core/agent.c",
      "if (g->cfg.instructions && g->ld_phase == LD_NONE) {", "if (g->cfg.instructions && g->ld_phase != LD_IMPORTS) {", *AGENT),
+    ("timeout-fraction-dropped", "src/core/tools.c",
+     "if (t->n % 1000) { sb_putc(&r, '.'); sb_puti(&r, t->n % 1000 / 100); }", "", *AGENT),
+    ("timeout-always-plural", "src/core/tools.c",
+     'sb_putz(&r, t->n == 1000 ? " second" : " seconds");', 'sb_putz(&r, " seconds");', *AGENT),
     ("oom-in-tool-swallowed", "src/core/agent.c",
      "    if (g->ta.failed) g->life.failed = 1;", "", *AGENT),
 ]

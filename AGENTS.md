@@ -85,3 +85,7 @@ The rules that keep this project what it is:
   Every mutation must be caught, or carry a note saying why it changes nothing.
 - Sanitizer builds need gcc here; this container's clang has no sanitizer runtime. Both
   compilers build the project clean with `-Wall -Wextra -Werror`.
+- `src/ringtail` builds only inside a RingTail checkout: `tools/to_ringtail.sh ../ringtail`, then
+  `make test` there (its `barb_tests` drive Barb over the serial console against a fake API). RingTail's
+  printf has no precision, so `%.*s` prints nothing useful; the NUL after every action string
+  (agent.h) is what lets platform code use plain `%s`.

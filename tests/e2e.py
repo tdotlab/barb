@@ -184,7 +184,7 @@ def test_timeout_and_interrupt():
     fake = Fake([tools(("bash", {"command": "sleep 31.5", "timeout_ms": 1000})), text("it timed out")])
     p, took = run(fake, ["-p", "x", "--yes"], d)
     out, err = result_of(fake.requests[1], "toolu_bash_0") if len(fake.requests) > 1 else (None, None)
-    check(out is not None and "[killed: it ran longer than 1 seconds" in out and err, f"timeout result {out!r}")
+    check(out is not None and "[killed: it ran longer than its limit of 1 second." in out and err, f"timeout result {out!r}")
     check(took < 10, f"timeout took {took:.1f}s")
     check(subprocess.run(["pgrep", "-f", "sleep 31.5"], capture_output=True).returncode != 0, "the timed-out command is gone")
     fake.stop()

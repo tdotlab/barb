@@ -752,9 +752,12 @@ static void t_bash(agent_t* g, call_t* c, const ev_t* ev) {
     else sb_putz(&r, "(no output)\n");
     int is_error = 0;
     if (ev->flags & PROC_TIMEDOUT) {
-        sb_putz(&r, "[killed: it ran longer than ");
+        // The limit as the model gave it: 1.5 seconds, not "1 seconds".
+        sb_putz(&r, "[killed: it ran longer than its limit of ");
         sb_puti(&r, t->n / 1000);
-        sb_putz(&r, " seconds. Use run_in_background for long commands.]");
+        if (t->n % 1000) { sb_putc(&r, '.'); sb_puti(&r, t->n % 1000 / 100); }
+        sb_putz(&r, t->n == 1000 ? " second" : " seconds");
+        sb_putz(&r, ". Use run_in_background for long commands, or a longer timeout_ms.]");
         is_error = 1;
     } else if (ev->flags & PROC_SIGNALED) {
         sb_putz(&r, "[killed by a signal]");
