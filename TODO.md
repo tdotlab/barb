@@ -32,10 +32,10 @@ and sent back intact. Sonnet medium.
 ## Platforms
 
 **Windows, what is left.** Barb runs there (src/win32, `build.cmd test`). Still to do: a live task
-against the real API from Windows (the tests use the fake one); a paste of several lines arrives
-as several messages, and should be one (bracketed paste, or gathering the keys that arrive
-together); and the line editor could move to the POSIX prompt too, which has only the terminal's
-line discipline. Sonnet high for the live run and the paste, Opus medium for moving the editor.
+against the real API from Windows (the tests use the fake one; it needs a key, so it waits for
+T's); and the line editor could move to the POSIX prompt too, which has only the terminal's line
+discipline and so still sends a multi-line paste as one message per line. Sonnet high for the live
+run, Opus medium for moving the editor.
 
 **RingTail, what is left.** Barb runs there (src/ringtail, tested in RingTail's QEMU suite, and
 it has done a live task). Still to do: a real HTTPS run from a RingTail machine to the API itself

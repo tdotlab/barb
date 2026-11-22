@@ -82,6 +82,13 @@ MUTATIONS = [
      "in_ready = CreateEventW(0, TRUE, FALSE, 0);", "in_ready = CreateEventW(0, FALSE, FALSE, 0);", *E2E_WIN),
     ("win-key-left-in-environment", "src/win32/main.c",
      'SetEnvironmentVariableW(L"ANTHROPIC_API_KEY", 0);', "", *E2E_WIN),
+    ("win-paste-never-gathers", "src/win32/main.c",
+     "if (more_text_waiting() && paste_add", "if (0 && paste_add", *E2E_WIN),
+    ("win-paste-ignores-rest-of-batch", "src/win32/main.c",
+     "for (DWORD i = batch_i + 1; i < batch_n; i++) if (text_key(&batch[i])) return 1;", "", *E2E_WIN),
+    ("win-paste-never-ends", "src/win32/main.c",
+     "    deliver_simple(EV_INPUT, 0, 0, paste);\n    paste_n = 0;\n",
+     "    deliver_simple(EV_INPUT, 0, 0, paste);\n", *E2E_WIN),
 ]
 
 WIN = os.name == "nt"

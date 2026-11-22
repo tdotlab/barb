@@ -79,8 +79,9 @@ combining characters wrapped the way the console draws them. Text goes to the co
 so it shows right whatever the code page.
 
 Differences from Linux: there is no SIGTERM, so a command that is stopped or times out is killed
-at once, with everything it started (a job object). A paste of several lines is sent as several
-messages, one per line.
+at once, with everything it started (a job object). A paste of several lines is one message, with
+its newlines: Enters that arrive with more text right behind them are gathered, and the last one
+sends it. (Lines you type one at a time are separate messages, as ever.)
 
 ## On RingTail
 

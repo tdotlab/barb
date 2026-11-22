@@ -191,12 +191,60 @@ static void answer(int ans, const char* word) {
     deliver_simple(EV_ANSWER, id, ans, 0);
 }
 
+// A paste arrives as keystrokes with an Enter after every line. Lines that are followed at once by
+// more text belong to one message, so they are gathered here and delivered together, with the
+// newlines the user pasted, when a line ends with nothing more waiting behind it.
+static char* paste;
+static size_t paste_n, paste_cap;
+
+static int paste_add(const char* p, size_t n) {
+    if (paste_n + n + 1 > paste_cap) {
+        size_t cap = paste_cap ? paste_cap : 4096;
+        while (cap < paste_n + n + 1) cap *= 2;
+        char* q = realloc(paste, cap);
+        if (!q) return 0;
+        paste = q;
+        paste_cap = cap;
+    }
+    memcpy(paste + paste_n, p, n);
+    paste_n += n;
+    paste[paste_n] = 0;
+    return 1;
+}
+
+// Is there typed text already waiting behind the key being handled? `rest` is what is left of the
+// batch the loop is reading; the console's own queue is looked at too. Part-way through a paste the
+// next chunk may still be on its way, so it is given a moment.
+static INPUT_RECORD* batch;
+static DWORD batch_i, batch_n;
+
+static int text_key(const INPUT_RECORD* r) {
+    return r->EventType == KEY_EVENT && r->Event.KeyEvent.bKeyDown && r->Event.KeyEvent.uChar.UnicodeChar >= 32;
+}
+
+static int more_text_waiting(void) {
+    for (DWORD i = batch_i + 1; i < batch_n; i++) if (text_key(&batch[i])) return 1;
+    for (int tries = 0; tries < 2; tries++) {
+        INPUT_RECORD pk[64];
+        DWORD got = 0;
+        if (PeekConsoleInputW(h_in, pk, 64, &got))
+            for (DWORD i = 0; i < got; i++) if (text_key(&pk[i])) return 1;
+        if (!paste_n || tries) break;
+        WaitForSingleObject(h_in, 40);
+    }
+    return 0;
+}
+
 static void enter(void) {
     if (!ed.shown) { if (spin_shown) clear_line(); ed_show(&ed); ed_flush(); }
     int n;
     const char* line = ed_take(&ed, &n);
     ed_flush();
-    deliver_simple(EV_INPUT, 0, 0, line);
+    if (more_text_waiting() && paste_add(line, (size_t)n) && paste_add("\n", 1)) return;
+    if (!paste_n) { deliver_simple(EV_INPUT, 0, 0, line); return; }
+    if (n) paste_add(line, (size_t)n);
+    deliver_simple(EV_INPUT, 0, 0, paste);
+    paste_n = 0;
 }
 
 // One key: `ch` is the character it typed (0 for none), `vk` the key, `ctrl` whether Ctrl was down.
@@ -292,11 +340,18 @@ static void console_record(const INPUT_RECORD* r) {
 
 // Whatever the console has for us, without waiting.
 static void read_console(void) {
-    INPUT_RECORD recs[64];
+    INPUT_RECORD recs[512];
     DWORD avail = 0, got = 0;
     while (stdin_open && !done && GetNumberOfConsoleInputEvents(h_in, &avail) && avail) {
-        if (!ReadConsoleInputW(h_in, recs, 64, &got) || !got) break;
-        for (DWORD i = 0; i < got && stdin_open && !done; i++) console_record(&recs[i]);
+        if (!ReadConsoleInputW(h_in, recs, 512, &got) || !got) break;
+        batch = recs;
+        batch_n = got;
+        for (DWORD i = 0; i < got && stdin_open && !done; i++) {
+            batch_i = i;
+            console_record(&recs[i]);
+        }
+        batch = 0;
+        batch_n = 0;
     }
 }
 
@@ -735,6 +790,7 @@ int wmain(int argc, wchar_t** wargv) {
     agent_free(agent);
     SecureZeroMemory(key, strlen(key));
     free(key);
+    free(paste);
     free(base);
     free(cwd);
     free(model_env);
