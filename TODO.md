@@ -31,11 +31,16 @@ and sent back intact. Sonnet medium.
 
 ## Platforms
 
-**Windows, what is left.** Barb runs there (src/win32, `build.cmd test`). Still to do: a live task
-against the real API from Windows (the tests use the fake one; it needs a key, so it waits for
-T's); and the line editor could move to the POSIX prompt too, which has only the terminal's line
-discipline and so still sends a multi-line paste as one message per line. Sonnet high for the live
-run, Opus medium for moving the editor.
+**Windows, what is left.** Barb runs there (src/win32, `build.cmd test`), and has done a live task
+against DeepSeek from Windows (2026-11-22: found cl through vswhere, worked around MSYS mangling
+`/c`, compiled and ran a program, slept through a background task; 13 model calls). Still to do:
+the line editor could move to the POSIX prompt too, which has only the terminal's line discipline
+and so still sends a multi-line paste as one message per line. Opus medium.
+
+**Redundant wake-ups.** In that live run the model set timers to "check" a background task whose
+completion message had already woken it, which cost four extra model calls. The bash tool's
+description should say that a finished background task wakes the model by itself, so a timer to
+check on it is wasted. Sonnet medium; check it live.
 
 **RingTail, what is left.** Barb runs there (src/ringtail, tested in RingTail's QEMU suite, and
 it has done a live task). Still to do: a real HTTPS run from a RingTail machine to the API itself
