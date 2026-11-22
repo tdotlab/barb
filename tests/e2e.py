@@ -414,31 +414,47 @@ def test_interactive_interrupt():
 
 
 def pty_session(argv, cwd, env, script, timeout=30):
-    """Run argv on a terminal. `script` is a list of (wait_for_text, then_send); returns
-    (exit status, all output, the steps that never happened)."""
+    """Run argv on a terminal. `script` is a list of (wait_for, then_send): wait_for is a text to
+    see after the previous step's, or a number of seconds to let pass. Returns (exit status, all
+    output, the steps that never happened)."""
     return (_conpty_session if WIN else _pty_session)(argv, cwd, env, script, timeout)
 
 
+def _step_due(step, seen, matched, sent_at):
+    """Where the step's text ends in `seen` if it is due now, else None."""
+    w = step[0]
+    if isinstance(w, (int, float)):
+        return matched if time.time() - sent_at >= w else None
+    at = seen.find(w, matched)
+    return None if at < 0 else at + len(w)
+
+
 def _pty_session(argv, cwd, env, script, timeout):
-    import pty, select
+    import pty, select, fcntl, termios
     master, slave = pty.openpty()
-    p = subprocess.Popen(argv, cwd=cwd, env=env, stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+
+    def own_terminal():   # the pty is its controlling terminal, so Ctrl-C is a signal, as for a user
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+    p = subprocess.Popen(argv, cwd=cwd, env=env, stdin=slave, stdout=slave, stderr=slave, close_fds=True,
+                         start_new_session=True, preexec_fn=own_terminal)
     os.close(slave)
-    seen, full, deadline = "", "", time.time() + timeout
+    seen, matched, sent_at, deadline = "", 0, time.time(), time.time() + timeout
     steps = list(script)
     while time.time() < deadline and p.poll() is None:
-        r, _, _ = select.select([master], [], [], 0.2)
+        r, _, _ = select.select([master], [], [], 0.1)
         if r:
             try:
                 data = os.read(master, 4096).decode("utf-8", "replace")
             except OSError:
                 break
             seen += data
-            full += data
-        if steps and steps[0][0] in seen:
+        end = _step_due(steps[0], seen, matched, sent_at) if steps else None
+        if end is not None:
             os.write(master, steps[0][1].encode())
-            seen = seen.replace(steps[0][0], "<matched>", 1)
+            matched, sent_at = end, time.time()
             steps.pop(0)
+    full = seen
     try:
         p.wait(timeout=10)
     except subprocess.TimeoutExpired:
@@ -540,13 +556,14 @@ def _conpty_session(argv, cwd, env, script, timeout):
         b, n = s.replace("\n", "\r").encode(), D()     # a terminal's Enter is CR
         k.WriteFile(in_w, b, len(b), ctypes.byref(n), None)
 
-    steps, matched, deadline = list(script), 0, time.time() + timeout
+    steps, matched, sent_at, deadline = list(script), 0, time.time(), time.time() + timeout
     while time.time() < deadline and k.WaitForSingleObject(pi.hProcess, 0) != 0:
-        take(0.2)
+        take(0.1)
         seen = raw.decode("utf-8", "replace")
-        if steps and steps[0][0] in seen[matched:]:
-            matched = seen.index(steps[0][0], matched) + len(steps[0][0])
+        end = _step_due(steps[0], seen, matched, sent_at) if steps else None
+        if end is not None:
             send(steps[0][1])
+            matched, sent_at = end, time.time()
             steps.pop(0)
     if k.WaitForSingleObject(pi.hProcess, 10000) != 0:
         k.TerminateProcess(pi.hProcess, 1)
@@ -614,19 +631,46 @@ def test_one_key_typeahead():
         ("> ", "go\n"),
         ("waiting for the model", "yyy"),   # typed ahead, before the question exists
         ("Allow?", "n"),
-        ("ok", "\x04"),
+        ("ok", "\x15\x04"),                 # the typed-ahead line waited at the prompt: clear it, then end
     ], timeout=30)
     check(not left, f"typeahead session finished; left {[x[0] for x in left]}\n{out!r}")
     check(not os.path.exists(os.path.join(d, "ahead.txt")), "keys typed before the question did not answer it")
     check("waiting for the model" in out, "a slow reply shows the waiting line")
+    check("> yyy" in re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", out), "the keys typed ahead are on the next prompt")
+    check(len(fake.requests) == 2, f"{len(fake.requests)} requests: the typed-ahead line was not sent")
+    check(code == 0, f"exit {code}")
+    fake.stop()
+
+
+def test_line_editing():
+    """The prompt's editor, fed the bytes a terminal sends: arrows, Ctrl-A and Ctrl-E, Ctrl-U,
+    Ctrl-C and Escape at an idle prompt (they clear the line, and stop nothing), Ctrl-D, and the
+    history."""
+    d = tempfile.mkdtemp()
+    fake = Fake([text("reply one"), text("reply two"), text("reply three"), text("reply four")])
+    code, out, left = pty_session([BARB], d, env_for(fake), [
+        ("> ", "wrld\x1b[D\x1b[D\x1b[Do\x01hello \x05!\n"),
+        ("reply one", "junk\x15gone"),
+        ("gone", "\x03"),
+        (0.5, "real\n"),
+        ("reply two", "oops\x1b"),
+        (0.5, "xfine\x01\x04\n"),                  # Ctrl-D in a line deletes forward
+        ("reply three", "\x1b[A\x1b[A\x1b[A\n"),   # three back: the first line
+        ("reply four", "\x04"),
+    ], timeout=30)
+    check(not left, f"editing session finished; left {[x[0] for x in left]}\n{out!r}")
+    sent = [last_user_texts(r) for r in fake.requests]
+    check(sent == [["hello world!"], ["real"], ["fine"], ["hello world!"]], f"the messages: {sent}")
+    check(code == 0, f"exit {code}")
+    no_problems(fake, "line_editing")
     fake.stop()
 
 
 def test_paste():
-    """Windows: lines that arrive together are one message, with the newlines they were pasted with;
-    a line typed afterwards is a message of its own. (The POSIX prompt is the terminal's own line
-    discipline, which cannot tell a paste from typing.)"""
-    if not WIN: return
+    """Lines that arrive together are one message, with the newlines they were pasted with; a line
+    typed afterwards is a message of its own. On POSIX the terminal is asked to bracket pastes, and
+    a bracketed paste is one message too: sent when it ends with an Enter, and otherwise when its
+    last line, which can still be added to, is."""
     d = tempfile.mkdtemp()
     fake = Fake([text("reply one"), text("reply two")])
     code, out, left = pty_session([BARB], d, env_for(fake), [
@@ -641,6 +685,75 @@ def test_paste():
               f"the pasted message: {last_user_texts(fake.requests[0])}")
         check(last_user_texts(fake.requests[1]) == ["typed later"], f"the next one: {last_user_texts(fake.requests[1])}")
     no_problems(fake, "paste")
+    fake.stop()
+    if WIN: return
+
+    fake = Fake([text("reply one"), text("reply two"), text("reply three")])
+    code, out, left = pty_session([BARB], d, env_for(fake), [
+        ("> ", "\x1b[200~alpha\nbeta\n\x1b[201~"),
+        ("reply one", "\x1b[200~one\n"),                 # a paste that arrives in two parts,
+        (0.3, "two\x1b[201~ and typed\n"),               # ending part-way through a line
+        ("reply two", "\x1b[200~gam\x01ma\tdelta\x1b[201~\n"),   # keys inside a paste are text
+        ("reply three", "\x04"),
+    ], timeout=30)
+    check(not left, f"bracketed paste session finished; left {[x[0] for x in left]}\n{out!r}")
+    sent = [last_user_texts(r) for r in fake.requests]
+    check(sent == [["alpha\nbeta"], ["one\ntwo and typed"], ["gamma delta"]], f"the bracketed pastes: {sent}")
+    check(out.rfind("\x1b[?2004l") > out.rfind("\x1b[?2004h") >= 0, "bracketed paste is asked for, and turned off at the end")
+    check(code == 0, f"exit {code}")
+    no_problems(fake, "bracketed_paste")
+    fake.stop()
+
+
+# A job-control shell for one job, as a shell runs barb: in its own process group, in the
+# foreground of the terminal. When the job stops it notes how the terminal was left, then
+# continues it (like `fg`) and passes on its exit status.
+JOBSHELL = r"""
+import os, sys, signal, time, termios
+status, argv = sys.argv[1], sys.argv[2:]
+signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+pid = os.fork()
+if pid == 0:
+    os.setpgid(0, 0)
+    os.tcsetpgrp(0, os.getpid())
+    signal.signal(signal.SIGTTOU, signal.SIG_DFL)
+    os.execv(argv[0], argv)
+try: os.setpgid(pid, pid)
+except OSError: pass
+while True:
+    _, st = os.waitpid(pid, os.WUNTRACED)
+    if not os.WIFSTOPPED(st):
+        sys.exit(os.WEXITSTATUS(st) if os.WIFEXITED(st) else 128 + os.WTERMSIG(st))
+    os.tcsetpgrp(0, os.getpgrp())
+    lflag = termios.tcgetattr(0)[3]
+    with open(status, "a") as f: f.write("stopped, line mode %d, echo %d\n" % (bool(lflag & termios.ICANON), bool(lflag & termios.ECHO)))
+    time.sleep(0.5)
+    os.tcsetpgrp(0, pid)
+    os.killpg(pid, signal.SIGCONT)
+"""
+
+
+def test_suspend():
+    """POSIX: Ctrl-Z gives the terminal back as it was before stopping, and the prompt comes back,
+    with what was being typed, when the job is continued. Ctrl-\\ does not kill barb."""
+    if WIN: return
+    d = tempfile.mkdtemp()
+    status = os.path.join(d, "status")
+    fake = Fake([text("reply one")])
+    code, out, left = pty_session([sys.executable, "-c", JOBSHELL, status, BARB], d, env_for(fake), [
+        ("> ", "half typed"),
+        ("half typed", "\x1a"),
+        (1.5, " more\n"),
+        ("reply one", "\x1c"),
+        (0.5, "\x04"),
+    ], timeout=30)
+    check(not left, f"suspend session finished; left {[x[0] for x in left]}\n{out!r}")
+    notes = open(status).read() if os.path.exists(status) else ""
+    check(notes == "stopped, line mode 1, echo 1\n", f"stopped once, with the terminal as it was: {notes!r}")
+    check(out.count("half typed") >= 2, "the line being typed is drawn again after it continues")
+    sent = [last_user_texts(r) for r in fake.requests]
+    check(sent == [["half typed more"]], f"and it can be finished: {sent}")
+    check(code == 0, f"exit {code}")
     fake.stop()
 
 
@@ -677,7 +790,7 @@ def test_startup_errors():
 if __name__ == "__main__":
     for t in (test_startup_errors, test_files_and_bash, test_key_not_inherited, test_background_wake, test_timeout_and_interrupt,
               test_permissions_and_errors, test_interactive_pipe, test_interactive_interrupt, test_interactive_permissions,
-              test_one_key_typeahead, test_paste, test_instructions):
+              test_one_key_typeahead, test_line_editing, test_paste, test_suspend, test_instructions):
         t()
     print(f"e2e: {checks} checks, {failed} failed")
     sys.exit(1 if failed else 0)

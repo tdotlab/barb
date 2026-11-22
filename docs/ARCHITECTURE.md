@@ -58,10 +58,11 @@ out-of-memory test tries it at every allocation point of a long scenario.
 | `src/core/agent.c` | the state machine: turns, retries, interrupts, background tasks | `test_agent` (scenarios, chaos, out of memory) |
 | `src/core/tools.c` | the six tools and their definitions | `test_agent` |
 | `src/posix/ops.c` | processes, curl, files, timers | `tests/e2e.py` |
-| `src/posix/main.c` | arguments, poll loop, terminal | `tests/e2e.py` (pipes and a pseudo-terminal) |
+| `src/posix/main.c` | arguments, the poll loop, the terminal in raw mode with bracketed paste, signals (Ctrl-C, Ctrl-Z, resize) through a self-pipe | `tests/e2e.py` (pipes, a pseudo-terminal, one under a job-control parent for Ctrl-Z) |
 | `src/win32/ops.c` | the same on Windows: Git Bash in job objects, overlapped pipes, `curl.exe`, long paths, atomic writes | `tests/e2e.py` |
 | `src/win32/main.c` | arguments, the `WaitForMultipleObjects` loop, the console in raw mode, Ctrl-C | `tests/e2e.py` (pipes, a hidden console, a ConPTY) |
-| `src/win32/edit.c` | the prompt's line editor: no I/O, it returns the bytes to draw | `test_edit` (a terminal emulator, both wrapping modes, random keys) |
+| `src/ui/edit.c` | the prompt's line editor, shared by POSIX and Windows: no I/O, it returns the bytes to draw | `test_edit` (a terminal emulator, both wrapping modes, random keys) |
+| `src/ui/keys.c` | turns a terminal's bytes into keys: escape sequences, UTF-8, bracketed paste; the caller times out a lone Escape | `test_keys` |
 | `src/ringtail/ops.c` | the same on RingTail: `sh -c` as jobs, `fetch` for HTTP, whole-file reads and saves | RingTail's `qemu_test.py`, `barb_tests` |
 | `src/ringtail/main.c` | `/barb.cfg`, the raw-mode line editor, the loop | the same, at the terminal over serial |
 | `tests/harness.h` | a fake world (scripted model, in-memory files, scripted processes) | used by `test_agent` |

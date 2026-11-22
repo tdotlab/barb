@@ -1,4 +1,4 @@
-// Tests for the prompt's line editor (src/win32/edit.c).
+// Tests for the prompt's line editor (src/ui/edit.c).
 //
 // The editor only produces bytes for a terminal, so the test plays them on a small terminal
 // emulator and looks at the screen: what each row shows and where the cursor is. It does this
@@ -6,7 +6,7 @@
 // once, or wait for the next character), because the editor must keep track of the cursor on
 // either. After the scripted cases, a long random run checks the screen after every key.
 #include "check.h"
-#include "../src/win32/edit.h"
+#include "../src/ui/edit.h"
 
 // ---- a terminal ----
 

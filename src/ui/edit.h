@@ -3,8 +3,8 @@
 //
 // It does no I/O and calls nothing beyond the string functions, so it is as portable as the
 // core: the platform turns key presses into ed_key calls and writes `out` to the terminal after
-// each call. Windows uses it today because its console has no line discipline worth keeping;
-// the other platforms can adopt it when the interface grows.
+// each call. Windows and POSIX both use it, with the terminal in raw mode (on POSIX, keys.c
+// turns the terminal's bytes into keys); RingTail keeps its own small editor.
 //
 // The screen model: the prompt and the line start at the left of a row and may wrap onto the
 // rows below. `row` is the row the terminal's cursor is on, counted from the prompt's row, so

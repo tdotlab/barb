@@ -31,6 +31,16 @@ like `-m deepseek/deepseek-chat` (it accepts the `x-api-key` header Barb sends; 
 In a session, `/clear` forgets the conversation, `/exit` or Ctrl-D quits, and Ctrl-C stops what
 is running (twice at the prompt quits); the model is told it was interrupted. Type while it works
 and your message is queued. While a reply is on its way, a line counts the seconds.
+
+The prompt has its own line editor (`src/ui/edit.c`, on Linux, macOS and Windows): arrows,
+Home/End, Ctrl- or Alt-arrows by word, Backspace and Delete, the readline keys (Ctrl-A, E, B, F, K,
+U, W, P, N, and Alt-B, Alt-F), Escape to clear the line, Up and Down through the history, and wide
+and combining characters wrapped the way the terminal draws them. Ctrl-C at a prompt with text on
+it clears the line; on Linux and macOS, Ctrl-Z suspends Barb with the terminal put back as it was. A paste of several
+lines is one message, with its newlines: on a terminal with bracketed paste (nearly all of them)
+the paste is marked, and otherwise Enters that arrive with more text right behind them are
+gathered. A paste that ends in a newline is sent; one that does not waits for you to finish the
+line. Lines you type one at a time are separate messages, as ever.
 `barb -p` exits 1 if the API call failed, so a script can tell.
 
 Project instructions: before the first request Barb reads `AGENTS.md` from the working directory
@@ -74,16 +84,12 @@ commands are written `/c/Users/...`; the file tools take either spelling. HTTP g
 the questions, sleeping on background tasks without a CPU cycle (the loop waits in
 `WaitForMultipleObjects`), Ctrl-C.
 
-The prompt has its own line editor (`src/win32/edit.c`): arrows, Home/End, Ctrl-arrows by word,
-Backspace and Delete, the readline keys (Ctrl-A, E, B, F, K, U, W, P, N), Escape to clear the
-line, Up and Down through the history, and wide and
-combining characters wrapped the way the console draws them. Text goes to the console as UTF-16,
-so it shows right whatever the code page.
+The console gets the same line editor as Linux; text goes to it as UTF-16, so it shows right
+whatever the code page. A paste there is told apart only by its Enters arriving with more text
+right behind them.
 
 Differences from Linux: there is no SIGTERM, so a command that is stopped or times out is killed
-at once, with everything it started (a job object). A paste of several lines is one message, with
-its newlines: Enters that arrive with more text right behind them are gathered, and the last one
-sends it. (Lines you type one at a time are separate messages, as ever.)
+at once, with everything it started (a job object).
 
 ## On RingTail
 
@@ -114,10 +120,12 @@ in its arguments. RingTail's shell holds 255 characters a line, so a long task g
   chaos test of event orders, and out-of-memory at every allocation point of a long scenario. A fake
   model and a fake world run the whole agent, and every request it builds is checked against the
   rules the API enforces (see docs/ARCHITECTURE.md);
-- `test_edit`: the Windows line editor (pure bytes, so it runs everywhere), played on a terminal
+- `test_edit`: the line editor (pure bytes, so it runs everywhere), played on a terminal
   emulator in both of the console's wrapping modes, with a randomized run of keys;
+- `test_keys`: the decoder that turns a terminal's bytes into keys: escape sequences, UTF-8
+  (overlong forms and other non-characters dropped), bracketed paste, and random bytes;
 - `tests/e2e.py`: the real binary against a fake API on localhost, including a pseudo-terminal
-  session for the permission prompts, Ctrl-C, timeouts, retries, and checks that the API key is
+  session for the permission prompts, line editing, pastes, Ctrl-C and Ctrl-Z, timeouts, retries, and checks that the API key is
   never on a command line and never in the environment of a command the model runs.
 
 On Windows, `build.cmd test` runs the same under AddressSanitizer, then `tests/e2e.py` against
@@ -149,5 +157,6 @@ Not tested: macOS, and sessions long enough to fill the context window.
 
 `src/core` is portable C (ISO C11, only `string.h`, `stddef.h` and `stdint.h`): the agent, the
 tools, the API layer, JSON, memory. `src/posix` is the Linux and macOS platform, `src/win32` is
-Windows', and `src/ringtail` is RingTail's, built in a RingTail checkout. `tools` has the mutation runner and the copy to RingTail. `tests` has the
+Windows', and `src/ringtail` is RingTail's, built in a RingTail checkout. `src/ui` is the line
+editor and the key decoder, as portable as the core and shared by POSIX and Windows. `tools` has the mutation runner and the copy to RingTail. `tests` has the
 tests and a fake world. `docs/ARCHITECTURE.md` is the map; `TODO.md` is what comes next.

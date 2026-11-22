@@ -7,6 +7,11 @@
 // to do; ops.c does it; this loop waits for the next thing to happen (the user typing, a
 // process or reply arriving, a timer) and hands it to the agent. When nothing is happening
 // it sleeps in poll(), which is what "waiting costs nothing" means in practice.
+//
+// An interactive session on a terminal puts it in raw mode: bytes arrive as they are typed, the
+// key decoder (src/ui/keys.c) turns them into keys, and the line editor (src/ui/edit.c) draws the
+// prompt, as on Windows. The terminal is asked to bracket pastes, so a pasted block of lines is
+// one message. Anything else (a pipe, a file, a terminal with no use for escapes) is read as lines.
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -14,12 +19,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/time.h>
 #include <sys/utsname.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
 #include "../core/agent.h"
+#include "../ui/edit.h"
+#include "../ui/keys.h"
 #include "ops.h"
 
 #define VERSION "0.2.0"
@@ -80,10 +88,32 @@ static int64_t http_since;     // when it went out (ms)
 static int spin_shown;         // the line is on the screen
 static int64_t spin_secs;      // the seconds it shows
 
+// The terminal when it is ours: raw keys, the key decoder, the line editor.
+static int interactive;
+static int raw_on;             // the terminal is in raw mode now
+static ed_t ed;
+static kd_t kd;
+static int64_t kd_deadline;    // when a key left part-way is given up (a lone ESC: the Escape key)
+
 static int64_t now_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, 0);
     return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+static void write_all(int fd, const char* s, size_t n) {
+    while (n) {
+        ssize_t w = write(fd, s, n);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) return;
+        s += w;
+        n -= (size_t)w;
+    }
+}
+
+static void ed_flush(void) {
+    if (ed.outn) write_all(2, ed.out, (size_t)ed.outn);
+    ed.outn = 0;
 }
 
 static void spin_clear(void) {
@@ -92,8 +122,14 @@ static void spin_clear(void) {
     spin_shown = 0;
 }
 
+// Take the typed line and the waiting line off the screen, so output can go where they were.
+static void clear_line(void) {
+    if (ed.shown) { ed_hide(&ed); ed_flush(); }
+    spin_clear();
+}
+
 static void spin_draw(void) {
-    if (!http_id || !tty_err || awaiting) return;
+    if (!http_id || !tty_err || awaiting || ed.shown) return;
     int64_t secs = (now_ms() - http_since) / 1000;
     if (secs < 2 || (spin_shown && secs == spin_secs)) return;
     fprintf(stderr, "\r\033[2K\033[2m  waiting for the model, %llds (Ctrl-C stops it)\033[0m", (long long)secs);
@@ -118,10 +154,42 @@ static void keys_off(void) {
     keys_mode = 0;
 }
 
+// Raw mode: no line discipline, no echo; Ctrl-C and Ctrl-Z stay signals (commands run in process
+// groups of their own, so the terminal sends those to barb alone). Output is still processed, so
+// "\n" is a new line. Ctrl-\ is turned off: its default is to dump core with the terminal raw.
+static void term_raw(void) {
+    struct termios t = cooked;
+    t.c_lflag &= ~(tcflag_t)(ICANON | ECHO | IEXTEN);
+    t.c_iflag &= ~(tcflag_t)(ICRNL | INLCR | IGNCR | IXON);
+    t.c_cc[VMIN] = 1;
+    t.c_cc[VTIME] = 0;
+#ifdef _POSIX_VDISABLE
+    t.c_cc[VQUIT] = _POSIX_VDISABLE;
+#endif
+    if (tcsetattr(0, TCSANOW, &t) != 0) return;
+    if (!raw_on) fputs("\033[?2004h", stderr);   // bracket pastes
+    raw_on = 1;
+}
+
+static void term_restore(void) {
+    if (!raw_on) return;
+    fputs("\033[?2004l", stderr);
+    tcsetattr(0, TCSANOW, &cooked);
+    raw_on = 0;
+}
+
+static int term_width(void) {
+    struct winsize w;
+    if (ioctl(2, TIOCGWINSZ, &w) == 0 && w.ws_col > 0) return w.ws_col;
+    return 80;
+}
+
 static void on_signal(int sig) {
-    char c = sig == SIGINT ? 'i' : 't';
+    char c = sig == SIGINT ? 'i' : sig == SIGWINCH ? 'w' : sig == SIGTSTP ? 'z' : sig == SIGCONT ? 'c' : 't';
+    int saved = errno;
     ssize_t r = write(selfpipe[1], &c, 1);
     (void)r;
+    errno = saved;
 }
 
 // ---- showing things to the user ----
@@ -137,7 +205,7 @@ static const char* color(int style) {
 }
 
 static void show(int style, str_t s) {
-    spin_clear();
+    clear_line();
     if (style == SAY_ASSISTANT) {
         fwrite(s.p, 1, s.n, stdout);
         fputc('\n', stdout);
@@ -155,6 +223,9 @@ static void show(int style, str_t s) {
 
 // ---- carrying out actions ----
 
+static int stdin_open = 1;
+static void read_waiting_keys(void);
+
 static void ask(const act_t* a) {
     if (oneshot || !tty_in) {
         fflush(stdout);
@@ -164,8 +235,15 @@ static void ask(const act_t* a) {
         return;
     }
     fflush(stdout);
-    spin_clear();
-    keys_on();   // before the question shows, so the flush cannot eat a quick answer
+    if (interactive) {
+        clear_line();
+        read_waiting_keys();   // keys typed before the question go to the line, so they cannot answer it
+        if (!stdin_open) { deliver_simple(EV_ANSWER, a->id, ANS_NO, 0); return; }
+        clear_line();
+    } else {
+        spin_clear();
+        keys_on();   // before the question shows, so the flush cannot eat a quick answer
+    }
     fprintf(stderr, "\n%s%.*s wants to:%s\n%.*s\n", color(SAY_TOOL), (int)a->a.n, a->a.p, tty_err ? "\033[0m" : "", (int)a->b.n, a->b.p);
     fprintf(stderr, "Allow? [y]es / [n]o / [a]lways this session: ");
     fflush(stderr);
@@ -213,7 +291,6 @@ static void drain_queue(void) {
 
 static char inbuf[65536];
 static size_t inlen;
-static int stdin_open = 1;
 
 static void handle_line(char* line, size_t n) {
     while (n && (line[n - 1] == '\r')) n--;
@@ -249,7 +326,154 @@ static int answer_key(char c) {
     return 1;
 }
 
+// A pasted block of lines is one message. The terminal brackets a paste, so each Enter inside one
+// adds its line here; a terminal that does not is caught the way Windows catches it, by lines
+// that are followed at once by more text. Delivered with the line that ends it, or, when the paste
+// itself ended with an Enter, when it ends.
+static char* paste;
+static size_t paste_n, paste_cap;
+
+static int paste_add(const char* p, size_t n) {
+    if (paste_n + n + 1 > paste_cap) {
+        size_t cap = paste_cap ? paste_cap : 4096;
+        while (cap < paste_n + n + 1) cap *= 2;
+        char* q = realloc(paste, cap);
+        if (!q) return 0;
+        paste = q;
+        paste_cap = cap;
+    }
+    memcpy(paste + paste_n, p, n);
+    paste_n += n;
+    paste[paste_n] = 0;
+    return 1;
+}
+
+static void deliver_paste(void) {
+    deliver_simple(EV_INPUT, 0, 0, paste);
+    paste_n = 0;
+}
+
+// The bytes being read, and the one being handled.
+static unsigned char rbuf[4096];
+static int rbuf_n, rbuf_i;
+
+// Is typed text already waiting behind the Enter being handled? Part-way through a paste the next
+// chunk may still be on its way, so it is given a moment.
+static int more_text_waiting(void) {
+    kd_t probe = kd;
+    kd_key_t k;
+    for (int i = rbuf_i + 1; i < rbuf_n; i++)
+        if (kd_feed(&probe, rbuf[i], &k) && k.kind == KD_EDIT && k.ed == EK_CHAR) return 1;
+    struct pollfd p = { 0, POLLIN, 0 };
+    return poll(&p, 1, paste_n ? 40 : 0) > 0 && (p.revents & POLLIN);
+}
+
+static void enter(void) {
+    if (!ed.shown && !awaiting) { spin_clear(); ed_show(&ed); ed_flush(); }
+    int n;
+    const char* line = ed_take(&ed, &n);
+    ed_flush();
+    if ((kd.pasting || more_text_waiting()) && paste_add(line, (size_t)n) && paste_add("\n", 1)) return;
+    if (!paste_n) { deliver_simple(EV_INPUT, 0, 0, line); return; }
+    if (n) paste_add(line, (size_t)n);
+    deliver_paste();
+}
+
+// Ctrl-D on an empty line, or the terminal gone: the end of input.
+static void end_input(void) {
+    clear_line();
+    fputc('\n', stderr);
+    stdin_open = 0;
+    if (paste_n) deliver_paste();
+    deliver_simple(EV_EOF, 0, 0, 0);
+}
+
+// Ctrl-C: stop the work; at an idle prompt, throw away what was typed (and pasted) first.
+static void interrupt(void) {
+    if (interactive && !awaiting && !agent_busy(agent) && (ed.n || paste_n || kd.pasting)) {
+        ed_key(&ed, EK_CLEAR, 0);
+        ed_flush();
+        paste_n = 0;
+        kd_init(&kd);
+        return;
+    }
+    deliver_simple(EV_INTERRUPT, 0, 0, 0);
+}
+
+static void on_key(const kd_key_t* k) {
+    // One key answers a question. Pasted text does not: it goes to the line, which waits.
+    if (awaiting && !kd.pasting && k->kind != KD_PASTE_END) {
+        switch (k->kind) {
+        case KD_ENTER: answer_key('\r'); break;
+        case KD_EOF: answer_key(4); break;
+        case KD_INTR: interrupt(); break;
+        case KD_EDIT:
+            if (k->ed == EK_CLEAR) answer_key(27);
+            else if (k->ed == EK_CHAR && k->ch < 0x80) answer_key((char)k->ch);
+            break;
+        }
+        return;
+    }
+    switch (k->kind) {
+    case KD_EDIT: ed_key(&ed, k->ed, k->ch); ed_flush(); break;
+    case KD_ENTER: enter(); break;
+    case KD_EOF:   // on an empty line, the end; otherwise delete forward, as in a shell
+        if (ed.n) { ed_key(&ed, EK_DEL, 0); ed_flush(); }
+        else end_input();
+        break;
+    case KD_INTR: interrupt(); break;
+    case KD_PASTE_END:   // a paste that ended with an Enter is sent; otherwise its last line waits
+        if (paste_n && !ed.n) deliver_paste();
+        break;
+    }
+}
+
+static void read_keys(void) {
+    ssize_t r = read(0, rbuf, sizeof rbuf);
+    if (r < 0 && (errno == EINTR || errno == EAGAIN)) return;
+    if (r <= 0) {              // the terminal has gone
+        if (awaiting) answer_key(4);
+        end_input();
+        return;
+    }
+    rbuf_n = (int)r;
+    for (rbuf_i = 0; rbuf_i < rbuf_n && stdin_open && !done; rbuf_i++) {
+        kd_key_t k;
+        if (kd_feed(&kd, rbuf[rbuf_i], &k)) on_key(&k);
+    }
+    rbuf_n = rbuf_i = 0;
+    // A sequence cut off mid-paste is most likely the end marker split across reads: wait longer.
+    if (kd_pending(&kd)) kd_deadline = now_ms() + (kd.pasting ? 1000 : 30);
+}
+
+// Whatever the terminal has for us, without waiting.
+static void read_waiting_keys(void) {
+    struct pollfd p = { 0, POLLIN, 0 };
+    while (stdin_open && !done && poll(&p, 1, 0) > 0 && (p.revents & (POLLIN | POLLHUP | POLLERR))) read_keys();
+}
+
+static void resize(void) {
+    if (ed.shown) { ed_hide(&ed); ed_flush(); }   // best effort: the old layout is gone either way
+    ed_set_width(&ed, term_width());
+}
+
+// Ctrl-Z: give the terminal back as it was, stop, and take it again when continued.
+static void suspend(void) {
+    clear_line();
+    term_restore();
+    fflush(stdout);
+    signal(SIGTSTP, SIG_DFL);
+    raise(SIGTSTP);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_signal;
+    sigaction(SIGTSTP, &sa, 0);
+    term_raw();
+    resize();
+}
+
 static void read_stdin(void) {
+    if (interactive) { read_keys(); return; }
     if (keys_mode && awaiting) {
         char c;
         ssize_t k = read(0, &c, 1);
@@ -286,16 +510,36 @@ static void read_signals(void) {
     char buf[32];
     ssize_t r = read(selfpipe[0], buf, sizeof buf);
     for (ssize_t i = 0; i < r; i++) {
-        if (buf[i] == 'i') deliver_simple(EV_INTERRUPT, 0, 0, 0);
-        else done = 1, exit_code = 143;     // SIGTERM
+        switch (buf[i]) {
+        case 'i': interrupt(); break;
+        case 'w': resize(); break;
+        case 'z': suspend(); break;
+        case 'c': term_raw(); break;        // continued after a stop barb did not see coming
+        default: done = 1, exit_code = 143; // SIGTERM
+        }
     }
+}
+
+// The prompt, when the user can type: not while a question waits, and not while the agent
+// works, unless something is being typed.
+static void ed_draw(void) {
+    if (!interactive || awaiting || !stdin_open || done || ed.shown) return;
+    if (agent_busy(agent) && ed.n == 0) return;
+    spin_clear();
+    ed_show(&ed);
+    ed_flush();
 }
 
 static void loop(void) {
     for (;;) {
+        if (interactive && kd_pending(&kd) && now_ms() >= kd_deadline) {
+            kd_key_t k;
+            if (kd_timeout(&kd, &k)) on_key(&k);
+        }
         drain_queue();
         if (done) return;
-        if (need_prompt && tty_in && !oneshot && stdin_open && !awaiting && !agent_busy(agent)) {
+        if (interactive) ed_draw();
+        else if (need_prompt && tty_in && !oneshot && stdin_open && !awaiting && !agent_busy(agent)) {
             spin_clear();
             fputs("> ", stderr);
             need_prompt = 0;
@@ -311,6 +555,11 @@ static void loop(void) {
         ops_fill(fds + n);
         int timeout = ops_timeout_ms();
         if (http_id && tty_err && (timeout < 0 || timeout > 250)) timeout = 250;  // keep the clock moving
+        if (interactive && kd_pending(&kd)) {
+            int64_t left = kd_deadline - now_ms();
+            if (left < 0) left = 0;
+            if (timeout < 0 || timeout > left) timeout = (int)left;
+        }
         int r = poll(fds, (nfds_t)(n + nops), timeout);
         if (r > 0) {
             if (fds[0].revents) read_signals();
@@ -409,6 +658,11 @@ int main(int argc, char** argv) {
     tty_in = isatty(0);
     tty_err = isatty(2);
     if (tty_in && tcgetattr(0, &cooked) != 0) tty_in = 0;
+    const char* term = getenv("TERM");
+    if (!oneshot && tty_in && tty_err && !(term && !strcmp(term, "dumb"))) {
+        term_raw();
+        interactive = raw_on;
+    }
 
     if (pipe(selfpipe) < 0) { perror("barb: pipe"); return 1; }
     fcntl(selfpipe[0], F_SETFD, FD_CLOEXEC);
@@ -419,6 +673,13 @@ int main(int argc, char** argv) {
     sigaction(SIGINT, &sa, 0);
     sigaction(SIGTERM, &sa, 0);
     signal(SIGPIPE, SIG_IGN);
+    if (interactive) {
+        ed_init(&ed, term_width());
+        atexit(term_restore);
+        sigaction(SIGWINCH, &sa, 0);
+        sigaction(SIGTSTP, &sa, 0);
+        sigaction(SIGCONT, &sa, 0);
+    }
 
     agent_cfg_t cfg;
     memset(&cfg, 0, sizeof cfg);
@@ -442,11 +703,14 @@ int main(int argc, char** argv) {
     }
     loop();
     keys_off();
-    spin_clear();
+    clear_line();
+    fflush(stdout);
+    term_restore();
 
     ops_shutdown();
     agent_free(agent);
     free(stdin_prompt);
     free(base_copy);
+    free(paste);
     return exit_code;
 }

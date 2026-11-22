@@ -19,7 +19,7 @@
 #include <string.h>
 #include <time.h>
 #include "../core/agent.h"
-#include "edit.h"
+#include "../ui/edit.h"
 #include "ops.h"
 
 #define VERSION "0.2.0"

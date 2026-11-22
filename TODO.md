@@ -33,9 +33,13 @@ and sent back intact. Sonnet medium.
 
 **Windows, what is left.** Barb runs there (src/win32, `build.cmd test`), and has done a live task
 against DeepSeek from Windows (2026-11-22: found cl through vswhere, worked around MSYS mangling
-`/c`, compiled and ran a program, slept through a background task; 13 model calls). Still to do:
-the line editor could move to the POSIX prompt too, which has only the terminal's line discipline
-and so still sends a multi-line paste as one message per line. Opus medium.
+`/c`, compiled and ran a program, slept through a background task; 13 model calls).
+
+**The prompt, what is left.** Both prompts share `src/ui`'s editor now. A pasted line longer than
+the editor's 8,192 bytes is cut there, and each line of a paste goes into the history as its own
+entry, so Up after a paste walks back through its lines; a paste should be one entry, and its
+lines unlimited. Sonnet medium. This is the ground for a nicer interface (a status line, the
+waiting line drawn below the prompt instead of in its place).
 
 **Redundant wake-ups.** In that live run the model set timers to "check" a background task whose
 completion message had already woken it, which cost four extra model calls. The bash tool's
