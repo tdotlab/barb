@@ -3,7 +3,7 @@
 A coding agent for the terminal, in C. You give it a task; it reads and edits files and runs
 commands in your working directory, asking before it changes anything. It is built the way
 RingTail's programs are: a core that does no I/O, tested on the host, and a thin layer for each
-platform. It runs on Linux, on macOS (untested), and on RingTail. Windows is next (see TODO.md).
+platform. It runs on Linux, on Windows, on macOS (untested), and on RingTail.
 
 Status: v0.2.0. It talks to the Anthropic Messages API (and anything that speaks it) and has six
 tools. It has done real work against a live model: multi-file bug fixes, a refactor across a
@@ -55,6 +55,33 @@ It retries overloaded and failed requests with growing delays, caches the system
 conversation so a long session pays for what is new, and keeps thinking blocks and any block type
 it does not know intact.
 
+## On Windows
+
+```
+set ANTHROPIC_API_KEY=...
+build.cmd
+build\barb.exe
+```
+
+`build.cmd` builds with MSVC (Visual Studio or its Build Tools, with the C++ workload); it finds
+them by itself from any prompt. Barb runs commands in Git Bash, so it needs Git for Windows; it
+finds the installation through the registry, `git.exe` on the path, or the usual folders, and
+`BARB_SHELL` names another `bash.exe`. The model is told it is on Windows and that paths in its
+commands are written `/c/Users/...`; the file tools take either spelling. HTTP goes through the
+`curl.exe` in System32 (Windows 10 and later). Everything else is the same as on Linux: the tools,
+the questions, sleeping on background tasks without a CPU cycle (the loop waits in
+`WaitForMultipleObjects`), Ctrl-C.
+
+The prompt has its own line editor (`src/win32/edit.c`): arrows, Home/End, Ctrl-arrows by word,
+Backspace and Delete, the readline keys (Ctrl-A, E, B, F, K, U, W, P, N), Escape to clear the
+line, Up and Down through the history, and wide and
+combining characters wrapped the way the console draws them. Text goes to the console as UTF-16,
+so it shows right whatever the code page.
+
+Differences from Linux: there is no SIGTERM, so a command that is stopped or times out is killed
+at once, with everything it started (a job object). A paste of several lines is sent as several
+messages, one per line.
+
 ## On RingTail
 
 `tools/to_ringtail.sh PATH/TO/RINGTAIL` copies the core and `src/ringtail` into that checkout's
@@ -88,10 +115,16 @@ in its arguments. RingTail's shell holds 255 characters a line, so a long task g
   session for the permission prompts, Ctrl-C, timeouts, retries, and a check that the API key is
   never on a command line.
 
+On Windows, `build.cmd test` runs the same three under AddressSanitizer, plus `test_edit` (the line
+editor, played on a terminal emulator in both of the console's wrapping modes, with a randomized
+run of keys), then `tests/e2e.py` against `build\barb-san.exe`; the pseudo-terminal session is a
+ConPTY there.
+
 `tools/mutate.py` breaks the code on purpose in listed ways and checks that a test fails each
 time; every mutation in its table is caught. The out-of-memory test refuses allocations two ways,
 every one from a point on and exactly one, and checks that a refusal always ends in a clean
-"Out of memory" stop. Not tested: macOS, and sessions long enough to fill the context window.
+"Out of memory" stop. It runs with `make` or with `build.cmd`, on whichever system it is on.
+Not tested: macOS, and sessions long enough to fill the context window.
 
 ## Limits
 
@@ -111,6 +144,6 @@ every one from a point on and exactly one, and checks that a refusal always ends
 ## Layout
 
 `src/core` is portable C (ISO C11, only `string.h`, `stddef.h` and `stdint.h`): the agent, the
-tools, the API layer, JSON, memory. `src/posix` is the Linux and macOS platform; `src/ringtail` is
-RingTail's, built in a RingTail checkout. `tools` has the mutation runner and the copy to RingTail. `tests` has the
+tools, the API layer, JSON, memory. `src/posix` is the Linux and macOS platform, `src/win32` is
+Windows', and `src/ringtail` is RingTail's, built in a RingTail checkout. `tools` has the mutation runner and the copy to RingTail. `tests` has the
 tests and a fake world. `docs/ARCHITECTURE.md` is the map; `TODO.md` is what comes next.

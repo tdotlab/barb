@@ -10,6 +10,16 @@
 
 static int checks_run, checks_failed;
 
+// strndup, which is POSIX and not in MSVC's C library.
+static inline char* dupn(const char* s, size_t n) {
+    char* d = malloc(n + 1);
+    if (!d) { printf("out of memory in a test\n"); exit(2); }
+    size_t i = 0;
+    while (i < n && s[i]) { d[i] = s[i]; i++; }
+    d[i] = 0;
+    return d;
+}
+
 #define CHECK(cond) do { \
     checks_run++; \
     if (!(cond)) { checks_failed++; printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); } \

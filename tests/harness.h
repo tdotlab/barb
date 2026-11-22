@@ -17,6 +17,7 @@ static int h_quiet;   // silence the notice about requests the script has no rep
 #define MAXOPS 128
 
 typedef struct { ev_t ev; char* data; size_t len; char* note; } qev_t;
+typedef struct { const char* match; const char* out; int code; int flags; } proc_script_t;   // a scripted command
 
 typedef struct {
     int64_t id;
@@ -41,7 +42,7 @@ typedef struct {
     struct { char path[96]; char* data; size_t len; int is_dir; } files[16];
     int nfiles;
 
-    struct { const char* match; const char* out; int code; int flags; } procs[8];
+    proc_script_t procs[8];
     int nprocs;
 
     char* says[256];
@@ -156,18 +157,18 @@ static void check_body(const char* body) {
             nblocks++;
             CHECK(json_get(blk, "type", &v) && json_as_str(&a, v, &type));
             if (str_eqz(type, "text")) {
-                str_t text;
+                str_t text = str_of(0, 0);
                 CHECK(json_get(blk, "text", &v) && json_as_str(&a, v, &text));
                 CHECK(text.n > 0);                    // no empty text blocks
                 if (!assistant) seen_non_result = 1;
             } else if (str_eqz(type, "tool_use")) {
-                str_t id;
+                str_t id = str_of(0, 0);
                 CHECK(assistant);
                 CHECK(json_get(blk, "id", &v) && json_as_str(&a, v, &id));
                 CHECK(json_get(blk, "input", &v));
                 if (npending < 16 && id.n < 64) { memcpy(pending[npending], id.p, id.n); pending[npending][id.n] = 0; npending++; }
             } else if (str_eqz(type, "tool_result")) {
-                str_t id;
+                str_t id = str_of(0, 0);
                 CHECK(!assistant);
                 CHECK(!seen_non_result);              // results come first in the user message
                 CHECK(json_get(blk, "tool_use_id", &v) && json_as_str(&a, v, &id));
@@ -198,10 +199,10 @@ static void w_act(world_t* w, const act_t* a) {
     CHECK(!a->c.p || a->c.p[a->c.n] == 0);
     switch (a->kind) {
     case ACT_SAY:
-        if (w->nsays < 256) { w->says[w->nsays] = strndup(a->a.p ? a->a.p : "", a->a.n); w->style[w->nsays++] = a->flag; }
+        if (w->nsays < 256) { w->says[w->nsays] = dupn(a->a.p ? a->a.p : "", a->a.n); w->style[w->nsays++] = a->flag; }
         break;
     case ACT_HTTP: {
-        char* body = strndup(a->b.p, a->b.n);
+        char* body = dupn(a->b.p, a->b.n);
         if (w->nbodies < 64) w->bodies[w->nbodies++] = body;
         check_body(body);
         CHECK(str_eqz(a->a, "/v1/messages"));
@@ -223,7 +224,7 @@ static void w_act(world_t* w, const act_t* a) {
         op_t* o = &w->ops[w->nops++];
         memset(o, 0, sizeof *o);
         o->id = a->id; o->kind = a->kind; o->a = strdup(path);
-        if (a->kind == ACT_WRITE) { o->c = strndup(a->b.p, a->b.n); }
+        if (a->kind == ACT_WRITE) { o->c = dupn(a->b.p, a->b.n); }
         if (w->hold_fs) break;
         ev_t e = { EV_FILE, a->id, FS_OK, 0, str_of(0, 0), str_of(0, 0), 0 };
         if (a->kind == ACT_WRITE) {
@@ -244,8 +245,8 @@ static void w_act(world_t* w, const act_t* a) {
         op_t* o = &w->ops[w->nops++];
         memset(o, 0, sizeof *o);
         o->id = a->id; o->kind = ACT_SPAWN; o->bg = a->flag; o->n = a->n;
-        o->a = strndup(a->a.p, a->a.n);
-        o->c = strndup(a->c.p ? a->c.p : "", a->c.n);
+        o->a = dupn(a->a.p, a->a.n);
+        o->c = dupn(a->c.p ? a->c.p : "", a->c.n);
         if (!a->flag && !w->hold_proc) {
             ev_t e = { EV_PROC, a->id, 0, 0, str_of(0, 0), str_of(0, 0), 10 };
             const char* out = "";
@@ -265,7 +266,7 @@ static void w_act(world_t* w, const act_t* a) {
         for (int i = 0; i < w->nops; i++) if (w->ops[i].id == a->id) w->ops[i].cancelled = 1;
         break;
     case ACT_ASK: {
-        if (w->nasks < 16) w->asks[w->nasks++] = strndup(a->b.p, a->b.n);
+        if (w->nasks < 16) w->asks[w->nasks++] = dupn(a->b.p, a->b.n);
         op_t* o = &w->ops[w->nops++];
         memset(o, 0, sizeof *o);
         o->id = a->id; o->kind = ACT_ASK;
@@ -377,7 +378,7 @@ static char* w_result(world_t* w, const char* id, int* is_error) {
                 if (bt != JT_OBJ || !json_capture(&cj, bt, &blk)) break;
                 if (!json_get(blk, "tool_use_id", &v) || !json_as_str(&a, v, &rid)) continue;
                 if (!(rid.n == strlen(id) && !memcmp(rid.p, id, rid.n))) continue;
-                if (json_get(blk, "content", &v) && json_as_str(&a, v, &text)) out = strndup(text.p, text.n);
+                if (json_get(blk, "content", &v) && json_as_str(&a, v, &text)) out = dupn(text.p, text.n);
                 if (is_error) *is_error = json_get(blk, "is_error", &v);
             }
         }

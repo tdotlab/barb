@@ -12,7 +12,7 @@ and the rules it keeps. When this map and a file disagree, the file is right; fi
          ▼                                   ▼
   ┌─────────────────────────┐        ┌───────────────────────┐
   │ platform (src/posix,    │ ─ev──▶ │ core (src/core)       │
-  │           src/ringtail) │ ◀─act─ │ agent.c  the state    │
+  │  src/win32,src/ringtail)│ ◀─act─ │ agent.c  the state    │
   │ main.c  the poll loop   │        │          machine      │
   │ ops.c   does the work   │        │                       │
   └─────────────────────────┘        │ tools.c  the tools    │
@@ -59,10 +59,13 @@ out-of-memory test tries it at every allocation point of a long scenario.
 | `src/core/tools.c` | the six tools and their definitions | `test_agent` |
 | `src/posix/ops.c` | processes, curl, files, timers | `tests/e2e.py` |
 | `src/posix/main.c` | arguments, poll loop, terminal | `tests/e2e.py` (pipes and a pseudo-terminal) |
+| `src/win32/ops.c` | the same on Windows: Git Bash in job objects, overlapped pipes, `curl.exe`, long paths, atomic writes | `tests/e2e.py` |
+| `src/win32/main.c` | arguments, the `WaitForMultipleObjects` loop, the console in raw mode, Ctrl-C | `tests/e2e.py` (pipes, a hidden console, a ConPTY) |
+| `src/win32/edit.c` | the prompt's line editor: no I/O, it returns the bytes to draw | `test_edit` (a terminal emulator, both wrapping modes, random keys) |
 | `src/ringtail/ops.c` | the same on RingTail: `sh -c` as jobs, `fetch` for HTTP, whole-file reads and saves | RingTail's `qemu_test.py`, `barb_tests` |
 | `src/ringtail/main.c` | `/barb.cfg`, the raw-mode line editor, the loop | the same, at the terminal over serial |
 | `tests/harness.h` | a fake world (scripted model, in-memory files, scripted processes) | used by `test_agent` |
-| `tools/mutate.py` | breaks the code in listed ways and checks a test catches each | run by hand after changing the core |
+| `tools/mutate.py` | breaks the code in listed ways and checks a test catches each | run by hand after changing the core; on Windows it builds with `build.cmd` and runs the mutations of the core and `src/win32` |
 
 ## The rules the conversation must keep
 
@@ -119,6 +122,9 @@ turn their results into events, and never call the agent re-entrantly. `src/posi
 interface the POSIX version uses; it is a good template, and `src/ringtail` shows how far the same
 shape stretches on a system with no fork, no environment and no SIGCHLD: commands are jobs stopped
 with `kill(-job)`, their end is found by asking whether the task is still there, and HTTP is a
-child program reading the key from a pipe. The core wants a `mem_t`, the clock only
+child program reading the key from a pipe. `src/win32` is a third shape: no fork and no signals,
+so a command is a suspended process put in a job object, every pipe is overlapped I/O, and the
+loop waits in one `WaitForMultipleObjects` on the console, the pipes, the processes and an event
+the Ctrl-C handler sets. The core wants a `mem_t`, the clock only
 through timers the platform runs, and nothing else. Show the prompt only when `agent_busy()` is 0,
 and set `instructions` in the config unless the user turned it off.

@@ -3,7 +3,7 @@
 Where Barb stands: v0.2.0. The core, six tools and the Linux/macOS platform work, and have done real
 tasks against a live model (DeepSeek through its Anthropic-compatible route): multi-file fixes, a
 refactor, CRLF edits, a 7,000-line file, background builds and servers, timers, and interactive
-sessions. Each task below stands on its own. Model suggestions are for Claude and Codex:
+sessions. The Windows platform passes the same tests and more. Each task below stands on its own. Model suggestions are for Claude and Codex:
 [Claude: Haiku, Sonnet, Opus] [Codex: Luna, Sol].
 
 ## Next
@@ -31,9 +31,11 @@ and sent back intact. Sonnet medium.
 
 ## Platforms
 
-**Windows.** `ops.c` again with CreateProcess and a job object (the process group), `curl.exe` or
-WinHTTP for HTTP, and the console. The core builds as is. Opus high, Codex Sol high: the process
-and signal semantics are where the quiet mistakes are.
+**Windows, what is left.** Barb runs there (src/win32, `build.cmd test`). Still to do: a live task
+against the real API from Windows (the tests use the fake one); a paste of several lines arrives
+as several messages, and should be one (bracketed paste, or gathering the keys that arrive
+together); and the line editor could move to the POSIX prompt too, which has only the terminal's
+line discipline. Sonnet high for the live run and the paste, Opus medium for moving the editor.
 
 **RingTail, what is left.** Barb runs there (src/ringtail, tested in RingTail's QEMU suite, and
 it has done a live task). Still to do: a real HTTPS run from a RingTail machine to the API itself

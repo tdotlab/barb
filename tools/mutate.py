@@ -8,6 +8,9 @@ always restored, and the target rebuilt from the restored source, even if the ru
 
     python3 tools/mutate.py            all mutations
     python3 tools/mutate.py busy load  only those whose name contains one of the words
+
+On Windows it builds with build.cmd (`build.cmd one NAME`) and runs only the mutations of the
+code that builds there: the core and src/win32. Elsewhere it uses make and skips src/win32.
 """
 import subprocess, sys, os
 
@@ -15,6 +18,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # (name, file, old text, new text, make target, command to run)
 AGENT = ("build/test_agent", ["build/test_agent"])
+EDIT = ("build/test_edit", ["build/test_edit"])
+E2E_WIN = ("build/barb-san", ["python", "tests/e2e.py", "build/barb-san.exe"])
 MUTATIONS = [
     ("interrupt-marker", "src/core/agent.c",
      'if (u) tr_add_text(&g->life, u, str_z("[barb] The user interrupted you here, before you replied."));', "(void)u;", *AGENT),
@@ -49,27 +54,69 @@ MUTATIONS = [
      'sb_putz(&r, t->n == 1000 ? " second" : " seconds");', 'sb_putz(&r, " seconds");', *AGENT),
     ("oom-in-tool-swallowed", "src/core/agent.c",
      "    if (g->ta.failed) g->life.failed = 1;", "", *AGENT),
+
+    # The Windows prompt's line editor. Its test plays the output on a terminal emulator.
+    ("edit-settle-no-cr", "src/win32/edit.c", 'putz(e, " \\r");', 'putz(e, " ");', *EDIT),
+    ("edit-settle-never", "src/win32/edit.c", "if (col < e->width) return row;", "if (col <= e->width) return row;", *EDIT),
+    ("edit-draw-unsettled", "src/win32/edit.c", "    er = settle(e, er, ec);\n", "", *EDIT),
+    ("edit-wrap-early", "src/win32/edit.c", "if (c + w > e->width) { r++; c = 0; }", "if (c + w >= e->width) { r++; c = 0; }", *EDIT),
+    ("edit-cursor-full-row", "src/win32/edit.c", "if (cc >= e->width) { cr++; cc = 0; }", "", *EDIT),
+    ("edit-hide-no-up", "src/win32/edit.c", "if (e->row) put_csi(e, e->row, 'A');", "", *EDIT),
+    ("edit-take-blank-row", "src/win32/edit.c", 'if (c < e->width) putz(e, "\\r\\n");', 'putz(e, "\\r\\n");', *EDIT),
+    ("edit-mark-fast-path", "src/win32/edit.c", "int at_end = e->cur == e->n && ed_cols(ch) > 0;", "int at_end = e->cur == e->n;", *EDIT),
+    ("edit-hidden-history-draws", "src/win32/edit.c",
+     "    if (e->shown) redraw(e);\n}\n\n// ---- editing", "    redraw(e);\n}\n\n// ---- editing", *EDIT),
+    ("edit-back-one-byte", "src/win32/edit.c", "cut(e, prev_char(e, e->cur), e->cur);", "cut(e, e->cur - 1, e->cur);", *EDIT),
+    ("edit-no-continuation", "src/win32/edit.c", "& 0xC0) == 0x80; }", "& 0xC0) == 0xC0; }", *EDIT),
+    ("edit-word-left-spaces", "src/win32/edit.c", "    while (i > 0 && is_space_at(e, prev_char(e, i))) i = prev_char(e, i);\n", "", *EDIT),
+    ("edit-no-room-for-nul", "src/win32/edit.c", "if (e->n + k > ED_MAX - 1) return;", "if (e->n + k > ED_MAX) return;", *EDIT),
+    ("edit-controls-typed", "src/win32/edit.c", "if (ch < 0x20 || ch == 0x7F || ", "if (", *EDIT),
+    ("edit-width-unclamped", "src/win32/edit.c", "e->width = width < 10 ? 10 : width;", "e->width = width;", *EDIT),
+    ("edit-history-dups", "src/win32/edit.c", "if (last >= 0 && !strcmp(e->hist + last, e->line)) return;", "(void)last;", *EDIT),
+    ("edit-history-no-draft", "src/win32/edit.c", "if (e->back == 0) { memcpy(e->draft, e->line, (size_t)e->n); e->draftn = e->n; }", "", *EDIT),
+    ("edit-history-drop-wrong", "src/win32/edit.c", "int drop = (int)strlen(e->hist) + 1;", "int drop = need;", *EDIT),
+    ("edit-clear-keeps-history", "src/win32/edit.c", "e->line[0] = 0; e->back = 0; break;", "e->line[0] = 0; break;", *EDIT),
+
+    # The Windows front end, through the end-to-end test.
+    ("win-stdin-event-auto-reset", "src/win32/main.c",
+     "in_ready = CreateEventW(0, TRUE, FALSE, 0);", "in_ready = CreateEventW(0, FALSE, FALSE, 0);", *E2E_WIN),
 ]
+
+WIN = os.name == "nt"
 
 
 def sh(cmd):
+    if cmd[0].startswith("build/"):     # a program of ours, by its full path (and .exe on Windows)
+        cmd = [os.path.join(ROOT, cmd[0]) + (".exe" if WIN else "")] + cmd[1:]
     return subprocess.run(cmd, cwd=ROOT, capture_output=True)
+
+
+def build(target):
+    if WIN:
+        return subprocess.run(["cmd", "/c", os.path.join(ROOT, "build.cmd"), "one", os.path.basename(target)], cwd=ROOT, capture_output=True)
+    return sh(["make", target])
+
+
+def builds_here(path):
+    return not path.startswith("src/posix") if WIN else not path.startswith("src/win32")
 
 
 def main():
     words = sys.argv[1:]
-    todo = [m for m in MUTATIONS if not words or any(w in m[0] for w in words)]
+    todo = [m for m in MUTATIONS if builds_here(m[1]) and (not words or any(w in m[0] for w in words))]
     survived = []
     for name, path, old, new, target, run in todo:
         full = os.path.join(ROOT, path)
         src = open(full, "rb").read()
+        if b"\r\n" in src:                # a checkout with Windows line endings
+            old, new = old.replace("\n", "\r\n"), new.replace("\n", "\r\n")
         if src.count(old.encode()) != 1:
             print(f"{name}: the text to replace is not in {path} exactly once; update this table")
             survived.append(name)
             continue
         try:
             open(full, "wb").write(src.replace(old.encode(), new.encode()))
-            b = sh(["make", target])
+            b = build(target)
             if b.returncode != 0:
                 print(f"{name}: caught (does not build)")
                 continue
@@ -79,7 +126,7 @@ def main():
             if not caught: survived.append(name)
         finally:
             open(full, "wb").write(src)
-            sh(["make", target])
+            build(target)
     print(f"{len(todo) - len(survived)} of {len(todo)} caught")
     sys.exit(1 if survived else 0)
 

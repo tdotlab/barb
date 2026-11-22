@@ -9,14 +9,15 @@ Read these before changing code:
 
 `make test` runs everything: the core's unit tests, the agent scenarios and a randomized
 chaos test (all under the address and undefined-behaviour sanitizers), then the end-to-end
-test against a fake API. Run it before committing. It takes about half a minute.
+test against a fake API. Run it before committing. It takes about half a minute. On Windows,
+`build.cmd test` is the same (MSVC, AddressSanitizer), plus the line editor's test.
 
 The rules that keep this project what it is:
 
 - `src/core` is portable C with no system calls: it includes only `stddef.h`, `stdint.h` and
   `string.h`, and calls nothing beyond the string functions. It must stay compilable as ISO C11
   (`-std=c11 -pedantic`) because RingTail, which has no real libc, has to be able to build it.
-  Anything that touches the system belongs in `src/posix` (or a future platform folder).
+  Anything that touches the system belongs in `src/posix`, `src/win32` or `src/ringtail`.
 - The core never sees the API key. The platform adds credentials to the request.
 - Every `tool_use` the model makes must get a `tool_result` in the next user message, whatever
   happens in between. `tests/harness.h` checks this on every request the agent builds; if you
@@ -24,7 +25,10 @@ The rules that keep this project what it is:
 - Tool results are written for a model to read: say what happened and what to do next.
 - New code gets tests, and the tests get mutation-checked: add the ways it could break to the
   table in `tools/mutate.py` and run it (`python3 tools/mutate.py WORD` runs the matching ones).
-  Every mutation must be caught, or carry a note saying why it changes nothing.
+  Every mutation must be caught, or carry a note saying why it changes nothing. It runs on Windows
+  too (through `build.cmd one NAME`), where it skips `src/posix` and runs `src/win32`'s.
+- `*.cmd` files are checked out with CRLF (`.gitattributes`): cmd misreads labels in a batch file
+  with bare LF endings.
 - Sanitizer builds need gcc here; this container's clang has no sanitizer runtime. Both
   compilers build the project clean with `-Wall -Wextra -Werror`.
 - `src/ringtail` builds only inside a RingTail checkout: `tools/to_ringtail.sh ../ringtail`, then

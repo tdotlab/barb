@@ -205,16 +205,16 @@ static void test_permissions(void) {
 static void test_bash(void) {
     world_t* w = w_new(1);
     w->nprocs = 7;
-    w->procs[5] = (typeof(w->procs[5])){ "sleep 15", "", 0, PROC_TIMEDOUT };
-    w->procs[6] = (typeof(w->procs[6])){ "sleep 16", "", 0, PROC_TIMEDOUT };
-    w->procs[0] = (typeof(w->procs[0])){ "echo", "hi\n", 0, 0 };
-    w->procs[1] = (typeof(w->procs[1])){ "false", "", 1, 0 };
-    w->procs[2] = (typeof(w->procs[2])){ "sleep 999", "partial", 0, PROC_TIMEDOUT };
-    w->procs[3] = (typeof(w->procs[3])){ "nonesuch", "", 0, PROC_FAILED };
+    w->procs[5] = (proc_script_t){ "sleep 15", "", 0, PROC_TIMEDOUT };
+    w->procs[6] = (proc_script_t){ "sleep 16", "", 0, PROC_TIMEDOUT };
+    w->procs[0] = (proc_script_t){ "echo", "hi\n", 0, 0 };
+    w->procs[1] = (proc_script_t){ "false", "", 1, 0 };
+    w->procs[2] = (proc_script_t){ "sleep 999", "partial", 0, PROC_TIMEDOUT };
+    w->procs[3] = (proc_script_t){ "nonesuch", "", 0, PROC_FAILED };
     char* big = malloc(60001);
     for (int i = 0; i < 60000; i++) big[i] = (i % 80 == 79) ? '\n' : 'a' + i % 26;
     big[60000] = 0;
-    w->procs[4] = (typeof(w->procs[4])){ "bigout", big, 0, 0 };
+    w->procs[4] = (proc_script_t){ "bigout", big, 0, 0 };
     w_reply_tools(w, TOOL("b1", "bash", J({"command":"echo hi"})) "," TOOL("b2", "bash", J({"command":"false"})) ","
                      TOOL("b3", "bash", J({"command":"sleep 999","timeout_ms":2000})) ","
                      TOOL("b4", "bash", J({"command":"nonesuch"})) "," TOOL("b5", "bash", J({"command":"bigout"})) ","
