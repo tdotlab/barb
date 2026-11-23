@@ -49,6 +49,21 @@ MUTATIONS = [
      'sb_putz(&r, t->n == 1000 ? " second" : " seconds");', 'sb_putz(&r, " seconds");', *AGENT),
     ("oom-in-tool-swallowed", "src/core/agent.c",
      "    if (g->ta.failed) g->life.failed = 1;", "", *AGENT),
+    # bash display: the command when nobody is asked, a capped and cleaned preview of the output
+    ("show-no-cap", "src/core/tools.c", "SHOW_LINES = 20", "SHOW_LINES = 200", *AGENT),
+    ("show-no-footer", "src/core/tools.c", "    if (total > shown) {", "    if (0) {", *AGENT),
+    ("show-footer-plural", "src/core/tools.c", 'total - shown == 1 ? " more line" : " more lines"', '" more lines"', *AGENT),
+    ("show-no-column-cut", "src/core/tools.c", "SHOW_COLS = 120", "SHOW_COLS = 1200", *AGENT),
+    ("show-raw-controls", "src/core/tools.c", "(len == 1 && (ch == '\\t' || (ch >= 32 && ch < 127)))", "1", *AGENT),
+    ("show-allows-c1", "src/core/tools.c", "(s[0] == 0xC2 && s[1] < 0xA0) ? 0 : 2", "2", *AGENT),
+    ("show-allows-overlong3", "src/core/tools.c", "if (s[0] == 0xE0 && s[1] < 0xA0) return 0;   // overlong", "", *AGENT),
+    ("show-allows-surrogate", "src/core/tools.c", "if (s[0] == 0xED && s[1] >= 0xA0) return 0;  // surrogate", "", *AGENT),
+    ("show-allows-overlong4", "src/core/tools.c", "if (s[0] == 0xF0 && s[1] < 0x90) return 0;   // overlong", "", *AGENT),
+    ("show-allows-past-max", "src/core/tools.c", "if (s[0] == 0xF4 && s[1] >= 0x90) return 0;  // past U+10FFFF", "", *AGENT),
+    ("show-no-utf8", "src/core/tools.c", "if (len > 1) sb_put(&b, out.p + k, len);", "if (0) sb_put(&b, out.p + k, len);", *AGENT),
+    ("show-no-command-echo", "src/core/tools.c", "        if (!needs_ask(g, BIT_BASH)) {\n            // Nobody", "        if (0) {\n            // Nobody", *AGENT),
+    ("show-command-when-asked", "src/core/tools.c", "        if (!needs_ask(g, BIT_BASH)) {\n            // Nobody", "        if (1) {\n            // Nobody", *AGENT),
+    ("show-no-output", "src/core/tools.c", "    say_output(g, out);\n", "    if (0) say_output(g, out);\n", *AGENT),
 ]
 
 

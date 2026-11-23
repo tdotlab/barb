@@ -43,7 +43,9 @@ Six tools: `read_file` (numbered lines, paged), `write_file`, `edit_file` (an ex
 which must be unique, in a file it has read), `bash`, `task_stop` and `schedule_wakeup`.
 Writing, editing and commands ask first: one key, `y`, `n`, or `a` for always this session (Enter
 or Escape is no). Anything typed before the question appeared is thrown away, so a line typed ahead
-cannot answer it.
+cannot answer it. A command's output is shown as it finishes (the first 20 lines, with a count of
+the rest; the model gets all of it), and when you are not being asked, because of `a` or `--yes`,
+the command itself is printed too, so a model's one-line title cannot hide what ran.
 
 The part it was written for: anything slow runs as a background task, and the agent goes to sleep.
 `bash` with `run_in_background` returns a task number at once and writes the output to

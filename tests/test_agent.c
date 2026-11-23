@@ -202,6 +202,95 @@ static void test_permissions(void) {
     w_free(w);
 }
 
+// What the user sees of a bash call: the command when nobody was asked, and a capped, cleaned preview of the output.
+static void test_bash_display(void) {
+    // Auto-approved: the command is printed, since the title is only the model's own words.
+    world_t* w = w_new(1);
+    char* lines = malloc(2000);
+    lines[0] = 0;
+    for (int i = 1; i <= 30; i++) { char l[32]; snprintf(l, sizeof l, "line %d\n", i); strcat(lines, l); }
+    w->nprocs = 1; w->procs[0] = (typeof(w->procs[0])){ "cat big", lines, 0, 0 };
+    w_reply_tools(w, TOOL("b1", "bash", J({"command":"cat big","description":"Disk free"})));
+    w_reply_text(w, "ok");
+    w_input(w, "go");
+    CHECK(w_said(w, "bash Disk free"));
+    CHECK(w_said(w, "  $ cat big"));
+    CHECK(w_said(w, "  | line 1"));
+    CHECK(w_said(w, "  | line 20"));
+    CHECK(!w_said(w, "  | line 21"));            // the cap is 20 lines
+    CHECK(w_said(w, "  | ... 10 more lines"));
+    CHECK_RESULT_HAS(w, "b1", "line 30\n[exit code: 0]");   // the model still gets all of it
+    w_free(w);
+    free(lines);
+
+    // One line over the cap says "line", not "lines".
+    w = w_new(1);
+    lines = malloc(2000);
+    lines[0] = 0;
+    for (int i = 1; i <= 21; i++) { char l[32]; snprintf(l, sizeof l, "n%d\n", i); strcat(lines, l); }
+    w->nprocs = 1; w->procs[0] = (typeof(w->procs[0])){ "seq", lines, 0, 0 };
+    w_reply_tools(w, TOOL("b1", "bash", J({"command":"seq"})));
+    w_reply_text(w, "ok");
+    w_input(w, "go");
+    CHECK(w_said(w, "  | ... 1 more line"));
+    CHECK(!w_said(w, "1 more lines"));
+    w_free(w);
+    free(lines);
+
+    // Exactly the cap: no footer. A long line is cut; control and malformed bytes become "?"; good UTF-8 stays.
+    w = w_new(1);
+    char* odd = malloc(900);
+    strcpy(odd, "esc \x1b[31mred\x1b[0m\nbad \xff z\ncaf\xc3\xa9\nc1 \xc2\x9b x\nbell \a tab\there\n"
+                  "ovl \xe0\x80\x80 x\nsur \xed\xa0\x80 x\nbig \xf4\x90\x80\x80 x\novl4 \xf0\x80\x80\x80 x\nemo \xf0\x9f\x98\x80 x\nshort \xe2\x82\n");
+    size_t n = strlen(odd);
+    for (int i = 0; i < 150; i++) odd[n + i] = 'x';
+    odd[n + 150] = '\n';
+    odd[n + 151] = 0;
+    w->nprocs = 1; w->procs[0] = (typeof(w->procs[0])){ "odd", odd, 0, 0 };
+    w_reply_tools(w, TOOL("b1", "bash", J({"command":"odd"})));
+    w_reply_text(w, "ok");
+    w_input(w, "go");
+    CHECK(w_said(w, "  | esc ?[31mred?[0m"));
+    CHECK(w_said(w, "  | bad ? z"));
+    CHECK(w_said(w, "  | caf\xc3\xa9"));
+    CHECK(w_said(w, "  | c1 ?? x"));
+    CHECK(w_said(w, "  | bell ? tab\there"));
+    CHECK(w_said(w, "  | ovl ??? x"));              // overlong forms and surrogates are not text
+    CHECK(w_said(w, "  | sur ??? x"));
+    CHECK(w_said(w, "  | big ???? x"));
+    CHECK(w_said(w, "  | ovl4 ???? x"));
+    CHECK(w_said(w, "  | emo \xf0\x9f\x98\x80 x"));    // a four-byte character is
+    CHECK(w_said(w, "  | short ??"));              // a cut-off sequence is not
+    CHECK(w_said(w, "xxxxxxxxxxxxxxxxxxxx ..."));
+    CHECK(!w_said(w, "more line"));
+    for (int i = 0; i < w->nsays; i++)
+        for (const char* q = w->says[i]; *q; q++) CHECK((unsigned char)*q == '\n' || (unsigned char)*q == '\t' || (unsigned char)*q >= 32);
+    w_free(w);
+    free(odd);
+
+    // Asked: the command is already in the question, so it is not printed again; the output still is.
+    w = w_new(0);
+    w->ask_answer = ANS_YES;
+    w->nprocs = 1; w->procs[0] = (typeof(w->procs[0])){ "echo", "hello\n", 0, 0 };
+    w_reply_tools(w, TOOL("b1", "bash", J({"command":"echo hello"})));
+    w_reply_text(w, "ok");
+    w_input(w, "go");
+    CHECK_INT(w->nasks, 1);
+    CHECK(!w_said(w, "  $ echo hello"));
+    CHECK(w_said(w, "  | hello"));
+    w_free(w);
+
+    // No output, no preview.
+    w = w_new(1);
+    w->nprocs = 1; w->procs[0] = (typeof(w->procs[0])){ "true", "", 0, 0 };
+    w_reply_tools(w, TOOL("b1", "bash", J({"command":"true"})));
+    w_reply_text(w, "ok");
+    w_input(w, "go");
+    CHECK(!w_said(w, "  | "));
+    CHECK(w_said(w, "  exit 0"));
+    w_free(w);
+}
+
 static void test_bash(void) {
     world_t* w = w_new(1);
     w->nprocs = 7;
@@ -910,6 +999,7 @@ int main(void) {
     test_write();
     test_permissions();
     test_bash();
+    test_bash_display();
     test_background();
     test_wakeup();
     test_interrupts();
