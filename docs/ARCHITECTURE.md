@@ -13,7 +13,7 @@ and the rules it keeps. When this map and a file disagree, the file is right; fi
   ┌─────────────────────────┐        ┌───────────────────────┐
   │ platform (src/posix,    │ ─ev──▶ │ core (src/core)       │
   │  src/win32,src/ringtail)│ ◀─act─ │ agent.c  the state    │
-  │ main.c  the poll loop   │        │          machine      │
+  │ main.c  the select loop │        │          machine      │
   │ ops.c   does the work   │        │                       │
   └─────────────────────────┘        │ tools.c  the tools    │
                                      │ api.c    transcript,  │
@@ -57,8 +57,8 @@ out-of-memory test tries it at every allocation point of a long scenario.
 | `src/core/api.c` | transcript, request body, reply parsing | `test_api` |
 | `src/core/agent.c` | the state machine: turns, retries, interrupts, background tasks | `test_agent` (scenarios, chaos, out of memory) |
 | `src/core/tools.c` | the six tools and their definitions | `test_agent` |
-| `src/posix/ops.c` | processes, curl, files, timers | `tests/e2e.py` |
-| `src/posix/main.c` | arguments, the poll loop, the terminal in raw mode with bracketed paste, signals (Ctrl-C, Ctrl-Z, resize) through a self-pipe | `tests/e2e.py` (pipes, a pseudo-terminal, one under a job-control parent for Ctrl-Z) |
+| `src/posix/ops.c` | processes, curl, files, timers, and `ops_wait`, the loop's select(2) (Apple's poll() cannot watch a terminal) | `tests/e2e.py`, `test_wait` |
+| `src/posix/main.c` | arguments, the select loop (`ops_wait`), the terminal in raw mode with bracketed paste, signals (Ctrl-C, Ctrl-Z, resize) through a self-pipe | `tests/e2e.py` (pipes, a pseudo-terminal, one under a job-control parent for Ctrl-Z) |
 | `src/win32/ops.c` | the same on Windows: Git Bash in job objects, overlapped pipes, `curl.exe`, long paths, atomic writes | `tests/e2e.py` |
 | `src/win32/main.c` | arguments, the `WaitForMultipleObjects` loop, the console in raw mode, Ctrl-C | `tests/e2e.py` (pipes, a hidden console, a ConPTY) |
 | `src/ui/edit.c` | the prompt's line editor, shared by POSIX and Windows: no I/O, it returns the bytes to draw | `test_edit` (a terminal emulator, both wrapping modes, random keys) |
@@ -129,7 +129,7 @@ types next. During tool calls, the running call and the ones after it get result
 
 `bash` with `run_in_background` starts a process whose output goes to `.barb/tasks/N.log` and
 returns at once. When the model ends its turn, the agent is idle with a task pending: it prints one
-line saying it is waiting and the platform blocks in `poll()`. When the task exits, the platform
+line saying it is waiting and the platform blocks in `select()`. When the task exits, the platform
 delivers an exit event, the agent queues a message about it and starts a model call. `schedule_wakeup`
 is the same with a timer. In one-shot mode (`-p`) the agent finishes once the user will type no
 more and nothing is pending. A model-call limit per user message (default 60) stops a loop of

@@ -44,6 +44,10 @@ build/test_md: tests/test_md.c tests/check.h src/ui/md.c src/ui/md.h src/ui/edit
 	@mkdir -p build
 	$(CC) $(WARN) $(SAN) tests/test_md.c src/ui/md.c src/ui/edit.c src/core/str.c src/core/arena.c -o $@
 
+build/test_wait: tests/test_wait.c tests/check.h $(CORE) src/posix/ops.c src/posix/ops.h
+	@mkdir -p build
+	$(CC) $(WARN) $(SAN) tests/test_wait.c src/posix/ops.c $(CORE) -o $@
+
 build/test_screen: tests/test_screen.c tests/check.h tests/term.h $(UI) $(HEADERS)
 	@mkdir -p build
 	$(CC) $(WARN) $(SAN) tests/test_screen.c src/ui/screen.c src/ui/md.c src/ui/edit.c src/core/str.c src/core/arena.c -o $@
@@ -53,7 +57,7 @@ build/barb-san: $(CORE) $(UI) $(POSIX) $(HEADERS)
 	@mkdir -p build
 	$(CC) $(WARN) $(SAN) $(CORE) $(UI) $(POSIX) -o $@
 
-test: build/test_core build/test_api build/test_agent build/test_edit build/test_keys build/test_md build/test_screen build/barb-san
+test: build/test_core build/test_api build/test_agent build/test_edit build/test_keys build/test_md build/test_screen build/test_wait build/barb-san
 	build/test_core
 	build/test_api
 	build/test_agent
@@ -61,6 +65,7 @@ test: build/test_core build/test_api build/test_agent build/test_edit build/test
 	build/test_keys
 	build/test_md
 	build/test_screen
+	build/test_wait
 	python3 tests/e2e.py build/barb-san
 
 clean:

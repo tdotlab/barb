@@ -61,5 +61,6 @@ for the HTTPS run, Opus high for MicroPython.
 
 ## Tests worth adding
 
-**macOS.** Run `make test` on a Mac. Probably only `ops.c` details (`pgrep`, `/proc` in the e2e key
-check, which is Linux-only) need changes.
+**macOS.** Run `make test` on a Mac. Checked here only under clang on Linux: the loop waits with
+select() and the e2e test lists processes with `ps` when there is no `/proc`, but neither has run on
+a real Mac. Still unchecked: terminal and `curl` details on macOS.

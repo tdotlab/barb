@@ -6,7 +6,7 @@
 // This file is the only place that touches the terminal. The agent (src/core) decides what
 // to do; ops.c does it; this loop waits for the next thing to happen (the user typing, a
 // process or reply arriving, a timer) and hands it to the agent. When nothing is happening
-// it sleeps in poll(), which is what "waiting costs nothing" means in practice.
+// it sleeps in select() (Apple's poll() cannot watch a terminal), which is what "waiting costs nothing" means in practice.
 //
 // An interactive session on a terminal puts it in raw mode: bytes arrive as they are typed, the
 // key decoder (src/ui/keys.c) turns them into keys, and the screen (src/ui/screen.c) keeps the
@@ -329,7 +329,7 @@ static int more_text_waiting(void) {
     for (int i = rbuf_i + 1; i < rbuf_n; i++)
         if (kd_feed(&probe, rbuf[i], &k) && k.kind == KD_EDIT && k.ed == EK_CHAR) return 1;
     struct pollfd p = { 0, POLLIN, 0 };
-    return poll(&p, 1, paste_n ? 40 : 0) > 0 && (p.revents & POLLIN);
+    return ops_wait(&p, 1, paste_n ? 40 : 0) > 0 && (p.revents & POLLIN);
 }
 
 static void enter(void) {
@@ -409,7 +409,7 @@ static void read_keys(void) {
 // Whatever the terminal has for us, without waiting.
 static void read_waiting_keys(void) {
     struct pollfd p = { 0, POLLIN, 0 };
-    while (stdin_open && !done && poll(&p, 1, 0) > 0 && (p.revents & (POLLIN | POLLHUP | POLLERR))) read_keys();
+    while (stdin_open && !done && ops_wait(&p, 1, 0) > 0 && (p.revents & (POLLIN | POLLHUP | POLLERR))) read_keys();
 }
 
 static void resize(void) { sc_resize(&scr, term_width()); }
@@ -513,7 +513,7 @@ static void loop(void) {
             if (left < 0) left = 0;
             if (timeout < 0 || timeout > left) timeout = (int)left;
         }
-        int r = poll(fds, (nfds_t)(n + nops), timeout);
+        int r = ops_wait(fds, (nfds_t)(n + nops), timeout);
         if (r > 0) {
             if (fds[0].revents) read_signals();
             if (stdin_slot >= 0 && fds[stdin_slot].revents) read_stdin();

@@ -22,6 +22,7 @@ EDIT = ("build/test_edit", ["build/test_edit"])
 KEYS = ("build/test_keys", ["build/test_keys"])
 MD = ("build/test_md", ["build/test_md"])
 SCREEN = ("build/test_screen", ["build/test_screen"])
+WAIT = ("build/test_wait", ["build/test_wait"])
 E2E = ("build/barb-san", ["python3", "tests/e2e.py", "build/barb-san"])
 E2E_WIN = ("build/barb-san", ["python", "tests/e2e.py", "build/barb-san.exe"])
 MUTATIONS = [
@@ -209,6 +210,10 @@ MUTATIONS = [
     ("posix-suspend-ignored", "src/posix/main.c", "        case 'z': suspend(); break;\n", "        case 'z': if (0) suspend(); break;\n", *E2E),
     ("posix-suspend-terminal-raw", "src/posix/main.c", "    term_restore();\n    signal(SIGTSTP", "    signal(SIGTSTP", *E2E),
     ("posix-suspend-default", "src/posix/main.c", "        sigaction(SIGTSTP, &sa, 0);\n        sigaction(SIGCONT", "        sigaction(SIGCONT", *E2E),
+    ("posix-wait-never-ready", "src/posix/ops.c", "{ fds[i].revents = POLLIN; ready++; }", "{ ready++; }", *WAIT),
+    ("posix-wait-no-timeout", "src/posix/ops.c", "        tp = &tv;\n", "        tp = 0; (void)tv;\n", *WAIT),
+    ("posix-wait-misses-last-fd", "src/posix/ops.c", "select(maxfd + 1, &rd", "select(maxfd, &rd", *WAIT),
+    ("posix-wait-seconds-as-ms", "src/posix/ops.c", "tv.tv_usec = (timeout_ms % 1000) * 1000;", "tv.tv_usec = (timeout_ms % 1000);", *WAIT),
     ("posix-ctrl-backslash-quits", "src/posix/main.c", "    t.c_cc[VQUIT] = _POSIX_VDISABLE;\n", "", *E2E),
 
     # The Windows front end, through the end-to-end test.

@@ -63,6 +63,14 @@ else:
     def cmdlines():
         """(pid, command line) for every process we may look at."""
         out = []
+        if not os.path.isdir("/proc"):      # macOS: ps (-ww so a long command line is not cut off)
+            ps = subprocess.run(["ps", "-axww", "-o", "pid=", "-o", "command="],
+                                capture_output=True, text=True, errors="replace").stdout
+            for line in ps.splitlines():
+                pid, _, cmd = line.strip().partition(" ")
+                if pid.isdigit():
+                    out.append((int(pid), cmd.strip()))
+            return out
         for pid in os.listdir("/proc"):
             if pid.isdigit():
                 try:

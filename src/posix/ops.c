@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -505,6 +506,32 @@ static void finish(op_t* o) {
         }
     }
     release(o);
+}
+
+int ops_wait(struct pollfd* fds, nfds_t n, int timeout_ms) {
+    fd_set rd;
+    FD_ZERO(&rd);
+    int maxfd = -1;
+    for (nfds_t i = 0; i < n; i++) {
+        fds[i].revents = 0;
+        if (fds[i].fd < 0) continue;
+        if (fds[i].fd >= FD_SETSIZE) return poll(fds, n, timeout_ms);   // cannot be selected on
+        FD_SET(fds[i].fd, &rd);
+        if (fds[i].fd > maxfd) maxfd = fds[i].fd;
+    }
+    struct timeval tv, *tp = 0;
+    if (timeout_ms >= 0) {
+        tv.tv_sec = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+        tp = &tv;
+    }
+    int r = select(maxfd + 1, &rd, 0, 0, tp);
+    if (r < 0 && errno == EBADF) return poll(fds, n, timeout_ms);       // poll names the bad one
+    if (r <= 0) return r;
+    int ready = 0;
+    for (nfds_t i = 0; i < n; i++)
+        if (fds[i].fd >= 0 && FD_ISSET(fds[i].fd, &rd)) { fds[i].revents = POLLIN; ready++; }
+    return ready;
 }
 
 void ops_service(const struct pollfd* fds) {

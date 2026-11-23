@@ -29,6 +29,11 @@ void ops_fill(struct pollfd* fds);
 int ops_timeout_ms(void);          // -1 if nothing is waiting on the clock
 void ops_service(const struct pollfd* fds);
 
+// Waits like poll(2) for POLLIN on the descriptors in fds, but through select(2): Apple's poll()
+// does not support terminals. Descriptors that are not readable get revents 0; end of file counts as
+// readable (the read then returns 0). A negative fd is ignored. timeout_ms < 0 waits for ever.
+int ops_wait(struct pollfd* fds, nfds_t n, int timeout_ms);
+
 void ops_shutdown(void);           // kill everything still running, remove temporary files
 
 #endif

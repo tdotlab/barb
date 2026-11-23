@@ -72,7 +72,7 @@ cannot answer it.
 The part it was written for: anything slow runs as a background task, and the agent goes to sleep.
 `bash` with `run_in_background` returns a task number at once and writes the output to
 `.barb/tasks/N.log`. While it waits, Barb makes no model calls and uses no CPU (it sleeps in
-`poll()`). When the task exits, or a `schedule_wakeup` timer fires, the model is woken with a message.
+`select()`). When the task exits, or a `schedule_wakeup` timer fires, the model is woken with a message.
 Add `.barb/` to your `.gitignore`.
 
 It retries overloaded and failed requests with growing delays, caches the system prompt and the
@@ -138,6 +138,8 @@ in its arguments. RingTail's shell holds 255 characters a line, so a long task g
   (overlong forms and other non-characters dropped), bracketed paste, and random bytes;
 - `test_md`: the markdown renderer, played on the emulator: every construct, wrapping with wide
   characters, hostile bytes, and random input;
+- `test_wait`: the main loop's wait (select behind poll's interface, because Apple's poll() cannot watch
+  a terminal): ready, not ready, end of file, timeouts, bad and very high descriptors;
 - `test_screen`: the screen (the record, the activity line, the footer) in each of its three modes,
   with both output streams played on the emulator and a randomized run of events, keys and resizes;
 - `tests/e2e.py`: the real binary against a fake API on localhost, including a pseudo-terminal
