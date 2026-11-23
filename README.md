@@ -5,6 +5,11 @@ commands in your working directory, asking before it changes anything. It is bui
 RingTail's programs are: a core that does no I/O, tested on the host, and a thin layer for each
 platform. It runs on Linux, on Windows, on macOS (untested), and on RingTail.
 
+Barb is written from scratch with no dependencies, and that is the point of the project: the agent,
+the JSON and markdown handling, the line editor and the screen are all its own C, with no library
+behind any of them. Building it takes only a C compiler. The one outside program it calls is `curl`,
+for HTTPS. It is built to be portable and tested down to the mutation, not to be small.
+
 Status: v0.2.0. It talks to the Anthropic Messages API (and anything that speaks it) and has six
 tools. It has done real work against a live model: multi-file bug fixes, a refactor across a
 project, edits that keep CRLF and tabs, paging through a 7,000-line file, background builds and

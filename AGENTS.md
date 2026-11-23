@@ -14,6 +14,10 @@ about half a minute. On Windows, `build.cmd test` is the same (MSVC, AddressSani
 
 The rules that keep this project what it is:
 
+- No dependencies. Barb is meant to be a from-scratch showcase (T's decision, 2026-11-23): do not
+  add a library (ncurses, a JSON or markdown library, and so on) to save effort. Write it, test it.
+  `curl` for HTTPS is the one outside program; keep it that way.
+
 - `src/core` is portable C with no system calls: it includes only `stddef.h`, `stdint.h` and
   `string.h`, and calls nothing beyond the string functions. It must stay compilable as ISO C11
   (`-std=c11 -pedantic`) because RingTail, which has no real libc, has to be able to build it.
