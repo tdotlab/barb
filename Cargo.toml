@@ -1,5 +1,5 @@
 [workspace]
-members = ["core"]
+members = ["core", "ui"]
 resolver = "2"
 
 [workspace.package]
@@ -12,3 +12,7 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# The UI tests play thousands of random keys on an emulated terminal; unoptimized, that is slow.
+[profile.test]
+opt-level = 1
