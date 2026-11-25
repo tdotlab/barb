@@ -13,7 +13,7 @@ import itertools, json, os, re, signal, subprocess, sys, tempfile, threading, ti
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 WIN = os.name == "nt"
-BARB = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else ("build/barb.exe" if WIN else "build/barb"))
+BARB = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else ("target/release/barb.exe" if WIN else "target/release/barb"))
 TEXT = dict(text=True, encoding="utf-8", errors="replace")     # barb speaks UTF-8 whatever the locale
 KEY = "test-key-9f3a1c"
 checks = failed = 0

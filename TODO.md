@@ -1,22 +1,29 @@
 # To do
 
-Where Barb stands: v0.2.0. The core, six tools and the Linux/macOS platform work, and have done real
-tasks against a live model (DeepSeek through its Anthropic-compatible route): multi-file fixes, a
-refactor, CRLF edits, a 7,000-line file, background builds and servers, timers, and interactive
-sessions. The Windows platform passes the same tests and more. Each task below stands on its own. Model suggestions are for Claude and Codex:
-[Claude: Haiku, Sonnet, Opus] [Codex: Luna, Sol].
+Where Barb stands: v0.2.0, in Rust (the C version's behaviour, port finished 2026-11-24; see
+docs/RUST_PORT.md). The core, six tools and the Linux/macOS and Windows platforms pass the same
+tests the C version did, and every mutation in `tools/mutate.py` is caught on both systems. The C
+version did real tasks against a live model (DeepSeek through its Anthropic-compatible route):
+multi-file fixes, a refactor, CRLF edits, a 7,000-line file, background builds and servers, timers,
+and interactive sessions. Each task below stands on its own. Model suggestions are for Claude and
+Codex: [Claude: Haiku, Sonnet, Opus] [Codex: Luna, Sol].
+
+**A live run of the Rust build.** Before anything else: one real task against a live model on
+Linux and one on Windows, interactive, with a background task and a Ctrl-C, as the C version had.
+The tests cover the same ground, but a live run is what found the C version's last bugs. Sonnet
+medium, Codex Luna medium.
 
 ## Next
 
 **Streaming replies.** The biggest gap in daily use: a long answer arrives after a minute of the
 waiting line. Show text as it is written, and lift the non-streaming limit on long replies.
 A server-sent-events parser in the core (host-tested against recorded streams), partial tool input
-accumulated as JSON, and `ops_http` passing curl's output through in pieces (`EV_HTTP_CHUNK`).
+accumulated as JSON, and the platforms' `http` passing curl's output through in pieces (an `Event::HttpChunk`).
 The design is the hard part. Opus high, Codex Sol high.
 
 **Compaction.** When `usage.input_tokens` nears the window, summarize the old part of the
-conversation (a model call with no tools) and replace it, keeping recent turns whole. Needs the
-transcript rebuilt in a fresh arena so the old one can be freed. Opus high, Codex Sol high.
+conversation (a model call with no tools) and replace it, keeping recent turns whole. The transcript
+is a plain `Vec` now, so dropping the old part frees it. Opus high, Codex Sol high.
 
 **Saved sessions.** Write the transcript to `.barb/sessions/` and resume it (`--resume`). Sonnet high.
 
@@ -31,20 +38,19 @@ and sent back intact. Sonnet medium.
 
 ## Platforms
 
-**Windows, what is left.** Barb runs there (src/win32, `build.cmd test`), and has done a live task
+**Windows, what is left.** Barb runs there (barb/src/win32), and the C version did a live task
 against DeepSeek from Windows (2026-11-22: found cl through vswhere, worked around MSYS mangling
 `/c`, compiled and ran a program, slept through a background task; 13 model calls).
 
-**The prompt, what is left.** Both prompts share `src/ui`'s editor now. A pasted line longer than
+**The prompt, what is left.** Both prompts share `ui`'s editor. A pasted line longer than
 the editor's 8,192 bytes is cut there, and each line of a paste goes into the history as its own
 entry, so Up after a paste walks back through its lines; a paste should be one entry, and its
 lines unlimited. Sonnet medium.
 
-**The screen, what is left.** `src/ui/screen.c` gives both prompts an activity line, a footer and a
+**The screen, what is left.** `ui/src/screen.rs` gives both prompts an activity line, a footer and a
 styled record, and replies are rendered as markdown. Still rough: markdown arrives a whole reply
 at a time (streaming would need the renderer fed line by line, which its design allows), and
-RingTail still has its own plainer display (its serial terminal takes the same escapes, so it
-could use `src/ui` too). Check
+RingTail still has the C version's plainer display. Check
 it by eye on a real terminal or two (Windows Terminal, conhost, a Linux console). Sonnet medium.
 
 **Redundant wake-ups.** In that live run the model set timers to "check" a background task whose
@@ -52,15 +58,16 @@ completion message had already woken it, which cost four extra model calls. The 
 description should say that a finished background task wakes the model by itself, so a timer to
 check on it is wasted. Sonnet medium; check it live.
 
-**RingTail, what is left.** Barb runs there (src/ringtail, tested in RingTail's QEMU suite, and
-it has done a live task). Still to do: a real HTTPS run from a RingTail machine to the API itself
-(the live run so far went through a plain-HTTP relay on the test host, because the cloud container
-reaches the internet only through a proxy QEMU's network cannot use); the waiting line and colours
-over serial are rough; and MicroPython on RingTail, so the agent can run Python there. Sonnet high
-for the HTTPS run, Opus high for MicroPython.
+**RingTail in Rust.** RingTail runs the C version, from its own copy in `vendor/barb`, so it no
+longer gets Barb's changes. `barb-core` and `barb-ui` are `no_std` and need only an allocator; what
+is missing is a Rust target for RingTail (a target spec, `core` and `alloc` built for it, a global
+allocator over its heap) and a platform module like `barb/src/posix` for its jobs, `fetch` and
+`/barb.cfg`. Still to do from the C days as well: a real HTTPS run from a RingTail machine to the
+API itself, and MicroPython there. Opus high for the target, Codex Sol high.
 
 ## Tests worth adding
 
-**macOS.** Run `make test` on a Mac. Checked here only under clang on Linux: the loop waits with
+**macOS.** Run `python3 tools/test.py` on a Mac. The C version was checked under clang on Linux; the Rust one not at all
+there. The loop waits with
 select() and the e2e test lists processes with `ps` when there is no `/proc`, but neither has run on
 a real Mac. Still unchecked: terminal and `curl` details on macOS.

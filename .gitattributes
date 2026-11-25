@@ -1,2 +1,0 @@
-# Windows batch files need CRLF: cmd misreads labels in LF-only files.
-*.cmd text eol=crlf
