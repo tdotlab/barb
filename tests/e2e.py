@@ -340,6 +340,20 @@ def test_timeout_and_interrupt():
     fake.server.shutdown()          # the handler thread is still asleep; do not wait for it
 
 
+def test_leftovers_killed():
+    """A command that starts something and leaves it running (a server, a `&` job) is done when it
+    exits: what it left behind is killed rather than waited for, so its result comes back at once."""
+    d = tempfile.mkdtemp()
+    fake = Fake([tools(("bash", {"command": "sleep 33.5 & echo started"})), text("ok")])
+    p, took = run(fake, ["-p", "x", "--yes"], d)
+    out, _ = result_of(fake.requests[1], "toolu_bash_0") if len(fake.requests) > 1 else (None, None)
+    check(out is not None and "started" in out and out.endswith("[exit code: 0]"), f"result {out!r}")
+    check(took < 4, f"took {took:.1f}s: what the command left running was waited for")
+    check(not running("sleep", "33.5"), "what the command left running is gone")
+    no_problems(fake, "leftovers_killed")
+    fake.stop()
+
+
 def test_permissions_and_errors():
     d = tempfile.mkdtemp()
     # Without --yes and with no one to ask, writes and commands are refused, and the model is told.
@@ -681,18 +695,24 @@ def test_paste():
     a bracketed paste is one message too: sent when it ends with an Enter, and otherwise when its
     last line, which can still be added to, is."""
     d = tempfile.mkdtemp()
-    fake = Fake([text("reply one"), text("reply two")])
+    # CR LF is one Enter, not two. (Not on Windows: a pseudo console turns that LF into a second
+    # Enter before barb sees it, so there it is win32's unit test.)
+    crlf = [] if WIN else [("reply two", "crlf one\r\ncrlf two\r\n")]
+    fake = Fake([text("reply one"), text("reply two")] + [text("reply three")] * len(crlf))
     code, out, left = pty_session([BARB], d, env_for(fake), [
         ("> ", "first line\nsecond line\n\nfourth, after a blank\n"),
         ("reply one", "typed later\n"),
-        ("reply two", "\x04"),
+    ] + crlf + [
+        ("reply three" if crlf else "reply two", "\x04"),
     ], timeout=30)
     check(not left, f"paste session finished; left {[x[0] for x in left]}\n{out!r}")
-    check(len(fake.requests) == 2, f"{len(fake.requests)} requests: a paste is one message")
-    if len(fake.requests) == 2:
+    check(len(fake.requests) == 2 + len(crlf), f"{len(fake.requests)} requests: a paste is one message")
+    if len(fake.requests) == 2 + len(crlf):
         check(last_user_texts(fake.requests[0]) == ["first line\nsecond line\n\nfourth, after a blank"],
               f"the pasted message: {last_user_texts(fake.requests[0])}")
         check(last_user_texts(fake.requests[1]) == ["typed later"], f"the next one: {last_user_texts(fake.requests[1])}")
+        if crlf:
+            check(last_user_texts(fake.requests[2]) == ["crlf one\ncrlf two"], f"the CR LF paste: {last_user_texts(fake.requests[2])}")
     no_problems(fake, "paste")
     fake.stop()
     if WIN: return
@@ -798,7 +818,7 @@ def test_startup_errors():
 
 if __name__ == "__main__":
     for t in (test_startup_errors, test_files_and_bash, test_key_not_inherited, test_background_wake, test_timeout_and_interrupt,
-              test_permissions_and_errors, test_interactive_pipe, test_interactive_interrupt, test_interactive_permissions,
+              test_leftovers_killed, test_permissions_and_errors, test_interactive_pipe, test_interactive_interrupt, test_interactive_permissions,
               test_one_key_typeahead, test_line_editing, test_paste, test_suspend, test_instructions):
         t()
     print(f"e2e: {checks} checks, {failed} failed")

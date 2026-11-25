@@ -30,7 +30,7 @@ pub enum Input {
 
 const SEQ: usize = 32;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Decoder {
     seq: [u8; SEQ], // an escape sequence so far, from its ESC
     seqn: usize,
@@ -226,6 +226,11 @@ impl Decoder {
             23 => edit(Key::KillWord),    // Ctrl-W
             _ => None,
         }
+    }
+
+    /// Between the brackets of a paste.
+    pub fn pasting(&self) -> bool {
+        self.pasting
     }
 
     /// A key is part-way through (an escape sequence or a UTF-8 character).

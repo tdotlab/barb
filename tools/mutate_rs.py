@@ -10,9 +10,10 @@ even if the run is interrupted.
     python3 tools/mutate_rs.py            all mutations
     python3 tools/mutate_rs.py busy load  only those whose name starts with one of the words
 
-cargo must be on PATH (or set CARGO to its path).
+cargo must be on PATH (or set CARGO to its path). Mutations of barb/src/posix run only on Linux and
+macOS, those of barb/src/win32 only on Windows.
 """
-import os, shutil, subprocess, sys
+import os, shutil, signal, subprocess, sys, tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CARGO = os.environ.get("CARGO") or shutil.which("cargo") or "cargo"
@@ -23,6 +24,12 @@ EDIT = ["-p", "barb-ui", "--test", "edit"]
 KEYS = ["-p", "barb-ui", "--test", "keys"]
 MD = ["-p", "barb-ui", "--test", "md"]
 SCREEN = ["-p", "barb-ui", "--test", "screen"]
+COMMON = ["-p", "barb", "--", "common::"]
+WAIT = ["-p", "barb", "--", "posix::sys::"]
+OPS = ["-p", "barb", "--", "posix::ops::"]
+WOPS = ["-p", "barb", "--", "win32::ops::"]
+WMAIN = ["-p", "barb", "--", "win32::tests::"]
+E2E = "e2e"    # a release build of barb, then tests/e2e.py against it
 
 # (name, file, old text, new text, test) or with a sixth element: which occurrence (1 is the first).
 MUTATIONS = [
@@ -204,15 +211,120 @@ MUTATIONS = [
     ('sc-lite-over-question', 'ui/src/screen.rs', '|| !self.animating || self.midline {', '|| !self.animating {', SCREEN),
     ('sc-lite-in-pipe', 'ui/src/screen.rs', 'if !status_ok || self.mode == Mode::Pipe || ', 'if !status_ok || ', SCREEN),
     ('sc-resize-md-width', 'ui/src/screen.rs', '        self.md.width = width;\n', '', SCREEN),
+
+    # What both platforms' programs share: the command line, kept output, talking to curl.
+    ('common-max-turns-unparsed', 'barb/src/common.rs', 'a.max_turns = atoi(', 'a.max_turns = 1 + 0 * atoi(', COMMON),
+    ('common-output-head-overfills', 'barb/src/common.rs', 'let take = (self.head_keep - self.head.len()).min(p.len());', 'let take = p.len();', COMMON),
+    ('common-output-drop-unmarked', 'barb/src/common.rs', '            out.extend_from_slice(format!("\\n[... {} bytes of output dropped here ...]\\n", dropped).as_bytes());\n', '', COMMON),
+    ('common-curl-000-kept', 'barb/src/common.rs', '        if s.ends_with(b"000") {\n            s = &s[..s.len() - 3];\n        }\n', '', COMMON),
+    ('common-curl-status-in-body', 'barb/src/common.rs', 'out[..cut - 1].to_vec()', 'out[..cut].to_vec()', COMMON),
+    ('common-key-not-wiped', 'barb/src/common.rs', '    for c in b.iter_mut() {', '    for c in b.iter_mut().take(0) {', COMMON),
+
+    # The POSIX program, through its own tests and the end-to-end test.
+    ('common-plain-http-user-is-host', 'barb/src/common.rs', "rfind('@').map_or(0, |i| i + 1)", "rfind('@').map_or(0, |_| 0)", COMMON),
+    ('common-plain-http-port-kept', 'barb/src/common.rs', "&h[..h.find(':').unwrap_or(h.len())]", 'h', COMMON),
+    ('posix-wait-never-ready', 'barb/src/posix/sys.rs', '            f.revents = POLLIN;\n            ready += 1;', '            ready += 1;', WAIT),
+    ('posix-wait-no-timeout', 'barb/src/posix/sys.rs', 'if timeout_ms >= 0 { &mut tv } else', 'if false { &mut tv } else', WAIT),
+    ('posix-wait-misses-last-fd', 'barb/src/posix/sys.rs', 'select(maxfd + 1, &mut rd', 'select(maxfd, &mut rd', WAIT),
+    ('posix-wait-seconds-as-ms', 'barb/src/posix/sys.rs', 'usec: ((timeout_ms % 1000) * 1000) as _', 'usec: (timeout_ms % 1000) as _', WAIT),
+    ('posix-wait-no-poll-fallback', 'barb/src/posix/sys.rs', '        if f.fd as usize >= FD_SETSIZE {\n            return poll_all(fds, timeout_ms);\n        }\n', '', WAIT),
+    ('posix-ops-no-time-limit', 'barb/src/posix/ops.rs', '&& o.deadline != 0 && !o.timed_out && now >= o.deadline {', '&& false {', OPS),
+    ('posix-ops-no-grace', 'barb/src/posix/ops.rs', '                o.timed_out = true;\n                o.kill(SIGTERM);', '                o.timed_out = true;\n                o.kill(SIGKILL);', OPS),
+    ('posix-ops-cancel-reported', 'barb/src/posix/ops.rs', 'Kind::Proc if !o.cancelled || o.bg => {', 'Kind::Proc => {', OPS),
+    ('posix-ops-timeout-is-signal', 'barb/src/posix/ops.rs', '            let exit = if o.timed_out {\n                Exit::TimedOut\n            } else if', '            let exit = if', OPS),
+    ('posix-ops-mode-lost', 'barb/src/posix/ops.rs', '.map(|m| m.permissions().mode() & 0o7777).unwrap_or(0o644);', '.map(|_| 0o644).unwrap_or(0o644);', OPS),
+    ('posix-ops-symlink-replaced', 'barb/src/posix/ops.rs', 'let target = fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());', 'let target = p.to_path_buf();', OPS),
+    ('posix-ops-read-unlimited', 'barb/src/posix/ops.rs', '    if md.is_file() && md.len() > READ_LIMIT {', '    if false {', OPS),
+    ('posix-ops-leftovers-kept', 'barb/src/posix/ops.rs', '                if !o.bg {\n                    o.kill(SIGKILL);\n                }\n', '', E2E),
+    ('posix-ops-tmp-left', 'barb/src/posix/ops.rs', '            let _ = fs::remove_file(&tmp);\n            file_err(id, &e)', '            file_err(id, &e)', OPS),
+    ('posix-key-left-in-environment', 'barb/src/posix/mod.rs', '    std::env::remove_var("ANTHROPIC_API_KEY");\n', '', E2E),
+    ('posix-no-bracketed-paste', 'barb/src/posix/mod.rs', '        write_all(2, b"\\x1b[?2004h"); // bracket pastes\n        RAW_ON', '        RAW_ON', E2E),
+    ('posix-paste-enter-sends', 'barb/src/posix/mod.rs', 'if self.kd.pasting() || self.more_text_waiting() {', 'if self.more_text_waiting() {', E2E),
+    ('posix-paste-end-not-sent', 'barb/src/posix/mod.rs', '                if !self.paste.is_empty() && self.scr.ed.line.is_empty() {\n                    self.deliver_paste();\n                }\n', '', E2E),
+    ('posix-paste-ignores-rest-of-read', 'barb/src/posix/mod.rs', '&self.rbuf[(self.rbuf_i + 1).min(self.rbuf_n)..self.rbuf_n]', '&self.rbuf[self.rbuf_n..self.rbuf_n]', E2E),
+    ('posix-ctrl-c-never-clears', 'barb/src/posix/mod.rs', '            && (!self.scr.ed.line.is_empty() || !self.paste.is_empty() || self.kd.pasting())', '            && false', E2E),
+    ('posix-ctrl-d-ends-typed-line', 'barb/src/posix/mod.rs', '                if !self.scr.ed.line.is_empty() {\n                    self.scr.key(Key::Del);\n                } else {\n                    self.end_input();\n                }', '                self.end_input();', E2E),
+    # No mutation for ask()'s read_waiting_keys(), for the reason the C table gives: the loop reads
+    # stdin before it services curl, so the call only closes a window no test can time.
+    ('posix-esc-never-times-out', 'barb/src/posix/mod.rs', '                if let Some(k) = self.kd.timeout() {\n                    self.on_key(k);\n                }', '                let _ = self.kd.timeout();', E2E),
+    ('posix-esc-wait-unbounded', 'barb/src/posix/mod.rs', '                if timeout < 0 || timeout > left {\n                    timeout = left;\n                }\n', '                let _ = left;\n', E2E),
+    ('posix-suspend-ignored', 'barb/src/posix/mod.rs', "                b'z' => self.suspend(),", "                b'z' => {}", E2E),
+    ('posix-suspend-terminal-raw', 'barb/src/posix/mod.rs', '        self.term_restore();\n        sys::on_signal(sys::SIGTSTP', '        sys::on_signal(sys::SIGTSTP', E2E),
+    ('posix-suspend-default', 'barb/src/posix/mod.rs', '        catch(sys::SIGTSTP);\n        catch(sys::SIGCONT);', '        catch(sys::SIGCONT);', E2E),
+    ('posix-ctrl-backslash-quits', 'barb/src/posix/mod.rs', '    t.cc[sys::VQUIT] = sys::VDISABLE;\n', '', E2E),
+    ('posix-question-unasked-allowed', 'barb/src/posix/mod.rs', '            self.scr.say(Style::Error, NOT_ALLOWED);\n            self.answer(id, Answer::No);', '            self.answer(id, Answer::Yes);', E2E),
+    # The Windows program: its operations through their own tests, the front end through the
+    # end-to-end test.
+    ('win-quote-trailing-backslash', 'barb/src/win32/ops.rs', 'b.extend(std::iter::repeat_n(bs_, bs * 2));\n            break;', 'b.extend(std::iter::repeat_n(bs_, bs));\n            break;', WOPS),
+    ('win-quote-before-quote', 'barb/src/win32/ops.rs', 'repeat_n(bs_, bs * 2 + 1)', 'repeat_n(bs_, bs + 1)', WOPS),
+    ('win-path-drive-kept', 'barb/src/win32/ops.rs', 'let mut t = vec![s[1], b\':\', b\'/\'];', 'let mut t = vec![b\'/\', s[1], b\'/\'];', WOPS),
+    ('win-path-tmp-kept', 'barb/src/win32/ops.rs', '} else if n >= 4 && &s[..4] == b"/tmp"', '} else if false && &s[..4] == b"/tmp"', WOPS),
+    ('win-path-long-unprefixed', 'barb/src/win32/ops.rs', 'if w.len() >= MAX_PATH - 12 && !w.starts_with(&verbatim) {', 'if false {', WOPS),
+    ('win-ops-no-time-limit', 'barb/src/win32/ops.rs', 'if o.kind == Kind::Proc && !o.exited && o.deadline != 0 && !o.timed_out && now >= o.deadline {', 'if false {', WOPS),
+    ('win-ops-timeout-is-signal', 'barb/src/win32/ops.rs', '                    let exit = if o.timed_out {\n                        Exit::TimedOut\n                    } else if', '                    let exit = if', WOPS),
+    ('win-ops-stderr-lost', 'barb/src/win32/ops.rs', 'si.si.std_error = out;', 'si.si.std_error = 0;', WOPS),
+    ('win-ops-pipe-held-open', 'barb/src/win32/ops.rs', '        close(out); // the child has its own', '        let _ = out; // the child has its own', WOPS),
+    ('win-ops-read-dir-opened', 'barb/src/win32/ops.rs', '    if attrs & 0x10 != 0 {', '    if false {', WOPS),
+    ('win-ops-write-over-dir', 'barb/src/win32/ops.rs', '            return Ev::file(id, Fs::IsDir, "it is a directory");\n', '', WOPS),
+    ('win-ops-missing-is-error', 'barb/src/win32/ops.rs', '        2 | 3 | 123 |', '        3 | 123 |', WOPS),
+    ('win-ops-leftovers-kept', 'barb/src/win32/ops.rs', '        if !o.bg && o.job != 0 {\n            // SAFETY: the job is ours.\n            unsafe { TerminateJobObject(o.job, 1) };\n        }\n', '', E2E),
+    ('win-stdin-event-auto-reset', 'barb/src/win32/mod.rs', 'let ready = unsafe { CreateEventW(null_mut(), 1, 0, null()) };', 'let ready = unsafe { CreateEventW(null_mut(), 0, 0, null()) };', E2E),
+    ('win-key-left-in-environment', 'barb/src/win32/mod.rs', '    std::env::remove_var("ANTHROPIC_API_KEY");\n', '', E2E),
+    ('win-paste-never-gathers', 'barb/src/win32/mod.rs', '        if self.more_text_waiting() {', '        if false {', E2E),
+    ('win-paste-ignores-rest-of-batch', 'barb/src/win32/mod.rs', 'if self.batch.iter().skip(self.batch_i + 1).any(is_text_key) {', 'if false {', E2E),
+    ('win-paste-never-ends', 'barb/src/win32/mod.rs', 'let mut p = std::mem::take(&mut self.paste);', 'let mut p = self.paste.clone();', E2E),
+    ('win-ctrl-c-never-clears', 'barb/src/win32/mod.rs', 'if !self.agent.busy() && !self.scr.ed.line.is_empty() {', 'if false {', E2E),
+    ('win-crlf-two-enters', 'barb/src/win32/mod.rs', 'if ch == 10 && *last == 13 {', 'if false {', WMAIN),
+    ('win-question-unasked-allowed', 'barb/src/win32/mod.rs', '            self.push(Ev::Answer { id, answer: Answer::No });\n            return;', '            self.push(Ev::Answer { id, answer: Answer::Yes });\n            return;', E2E),
 ]
 
 
+WIN = os.name == "nt"
+
+
+def sh(cmd, limit):
+    """The command's exit code and output. One that runs past `limit` seconds has hung, which a
+    test run would notice too, so it counts as a failure (code -1). Output goes to a file, not
+    a pipe, and a hung command is killed with everything it started: a test binary left
+    holding a pipe would otherwise keep the wait going forever."""
+    with tempfile.TemporaryFile() as out:
+        if WIN:
+            p = subprocess.Popen(cmd, cwd=ROOT, stdout=out, stderr=subprocess.STDOUT)
+        else:
+            p = subprocess.Popen(cmd, cwd=ROOT, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            code = p.wait(timeout=limit)
+        except subprocess.TimeoutExpired:
+            if WIN:
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], capture_output=True)
+            else:
+                os.killpg(p.pid, signal.SIGKILL)
+            p.wait()
+            code = None
+        out.seek(0)
+        text = out.read().decode("utf-8", "replace")
+    if code is None:
+        return -1, text + f"\n(hung: stopped after {limit} s)\n"
+    return code, text
+
+
 def run(test):
-    r = subprocess.run([CARGO, "test", "-q", *test], cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=1200)
-    out = r.stdout + r.stderr
+    if test == E2E:
+        code, out = sh([CARGO, "build", "-q", "--release", "-p", "barb"], 1200)
+        if code == 0:
+            target = os.environ.get("CARGO_TARGET_DIR") or os.path.join(ROOT, "target")
+            barb = os.path.join(target, "release", "barb.exe" if WIN else "barb")
+            code, more = sh([sys.executable, "tests/e2e.py", barb], 600)
+            return ("caught" if code else "SURVIVED"), out + more
+    else:
+        code, out = sh([CARGO, "test", "-q", *test], 600)
     if "error[" in out or "error: could not compile" in out:
         return "DOES NOT COMPILE", out
-    return ("caught" if r.returncode else "SURVIVED"), out
+    return ("caught" if code else "SURVIVED"), out
+
+
+def runs_here(path):
+    return not path.startswith("barb/src/posix") if WIN else not path.startswith("barb/src/win32")
 
 
 def main():
@@ -221,7 +333,7 @@ def main():
     for m in MUTATIONS:
         name, path, old, new, test = m[:5]
         nth = m[5] if len(m) > 5 else 1
-        if words and not any(name.startswith(w) for w in words):
+        if (words and not any(name.startswith(w) for w in words)) or not runs_here(path):
             continue
         full = os.path.join(ROOT, path)
         with open(full, encoding="utf-8", newline="") as f:

@@ -113,7 +113,7 @@ pub struct Screen {
     http_failed: bool,
     last: Gap,
     // a question waits on the line for its answer
-    midline: bool,
+    pub midline: bool,
     /// Lite: the status line is on the screen.
     pub status_shown: bool,
     status: Vec<u8>,
@@ -966,6 +966,13 @@ impl Screen {
         self.gap(2, Gap::User);
         self.ed.show();
         self.flush_ed();
+        let line = self.ed.take();
+        self.flush_ed();
+        line
+    }
+
+    /// Enter while a question waits, when the line is not on the screen: the line, taken.
+    pub fn take_unshown(&mut self) -> Vec<u8> {
         let line = self.ed.take();
         self.flush_ed();
         line

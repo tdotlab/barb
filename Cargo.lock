@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "barb"
+version = "0.2.0"
+dependencies = [
+ "barb-core",
+ "barb-ui",
+]
+
+[[package]]
 name = "barb-core"
 version = "0.1.0"
 

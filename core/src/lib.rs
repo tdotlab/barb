@@ -2,6 +2,7 @@
 //! calls and needs only an allocator, so any platform (POSIX, Windows, a kernel with no libc)
 //! can drive it.
 #![no_std]
+#![forbid(unsafe_code)]
 extern crate alloc;
 
 #[macro_use]
