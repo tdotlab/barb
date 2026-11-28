@@ -296,6 +296,19 @@ pub fn load_session(data: &[u8]) -> Option<Session> {
     Some(s)
 }
 
+/// Whether `b` is the result of call `id`: a result kept as it came (its content is not a
+/// string) answers its call too.
+fn answers(b: &Block, id: &[u8]) -> bool {
+    match b {
+        Block::ToolResult { id: r, .. } => r == id,
+        Block::Raw(j) => {
+            get_str(j, "type").as_deref() == Some(b"tool_result".as_slice())
+                && get_str(j, "tool_use_id").as_deref() == Some(id)
+        }
+        _ => false,
+    }
+}
+
 impl Transcript {
     /// Make a transcript that was cut off (Barb was closed while tools ran, or a file was edited
     /// by hand) one the API accepts: every tool_use gets a tool_result at the start of the next
@@ -337,7 +350,7 @@ impl Transcript {
             let next = &mut self.msgs[i + 1];
             let mut k = 0;
             for id in ids {
-                let has = next.blocks.iter().any(|b| matches!(b, Block::ToolResult { id: r, .. } if *r == id));
+                let has = next.blocks.iter().any(|b| answers(b, &id));
                 if !has {
                     next.blocks.insert(
                         k,

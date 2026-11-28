@@ -146,7 +146,11 @@ MUTATIONS = [
     ('repair-keeps-empty', 'core/src/api.rs', '        self.msgs.retain(|m| m.blocks.iter().any(Block::emittable));\n', '', API),
     ('repair-no-merge', 'core/src/api.rs', 'if self.msgs[i].assistant == self.msgs[i - 1].assistant {', 'if false {', API),
     ('repair-no-new-user-msg', 'core/src/api.rs', "            if !matches!(self.msgs.get(i + 1), Some(m) if !m.assistant) {\n                self.msgs.insert(i + 1, Msg { assistant: false, blocks: Vec::new() });\n            }\n", "            if self.msgs.len() == i + 1 {\n                break;\n            }\n", API),
-    ('repair-duplicates-results', 'core/src/api.rs', "let has = next.blocks.iter().any(|b| matches!(b, Block::ToolResult { id: r, .. } if *r == id));", "let has = false;", API),
+    ('repair-duplicates-results', 'core/src/api.rs', "let has = next.blocks.iter().any(|b| answers(b, &id));", "let has = false;", API),
+    ('repair-any-result-answers', 'core/src/api.rs', 'Block::ToolResult { id: r, .. } => r == id,', 'Block::ToolResult { .. } => true,', API),
+    ('repair-raw-never-answers', 'core/src/api.rs', 'Block::Raw(j) => {\n            get_str', 'Block::Raw(j) => {\n            false && get_str', API),
+    ('repair-raw-any-type', 'core/src/api.rs', 'get_str(j, "type").as_deref() == Some(b"tool_result".as_slice())', 'true', API),
+    ('repair-raw-any-id', 'core/src/api.rs', 'get_str(j, "tool_use_id").as_deref() == Some(id)', 'true', API),
     ('repair-results-at-end', 'core/src/api.rs', '                    next.blocks.insert(\n                        k,', '                    next.blocks.insert(\n                        next.blocks.len(),', API),
 
     # The prompt's line editor. Its test plays the output on a terminal emulator.
@@ -478,6 +482,8 @@ def main():
         full = os.path.join(ROOT, path)
         with open(full, encoding="utf-8", newline="") as f:
             src = f.read()
+        if "\r\n" in src:  # A Windows checkout. The rows are written with bare LF.
+            old, new = old.replace("\n", "\r\n"), new.replace("\n", "\r\n")
         at = -1
         for _ in range(nth):
             at = src.find(old, at + 1)

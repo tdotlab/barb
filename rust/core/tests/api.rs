@@ -354,6 +354,28 @@ fn repair() {
     assert_eq!(t.repair(), 0);
     assert_eq!(shape(&t), ["u: text(a) text(b)", "a: text(c)"]);
 
+    // A result kept as it came (its content is not a string) answers its call; one for another
+    // call, or a block of another type with the same id, does not.
+    let raw = |kind: &str, id: &str| {
+        Block::Raw(format!("{{\"type\":\"{kind}\",\"tool_use_id\":\"{id}\",\"content\":[]}}").into_bytes())
+    };
+    let mut t = Transcript {
+        msgs: vec![
+            msg(true, vec![tu("e")]),
+            msg(false, vec![raw("tool_result", "e")]),
+        ],
+    };
+    assert_eq!(t.repair(), 0);
+    assert_eq!(shape(&t), ["a: use(e)", "u: raw"]);
+    let mut t = Transcript {
+        msgs: vec![
+            msg(true, vec![tu("e")]),
+            msg(false, vec![raw("tool_result", "ee"), raw("tool_reslt", "e")]),
+        ],
+    };
+    assert_eq!(t.repair(), 1);
+    assert_eq!(shape(&t), ["a: use(e)", "u: result(e!) raw raw"]);
+
     // Calls in a message that ended up joined to the next one are still answered.
     let mut t = Transcript { msgs: vec![msg(true, vec![tu("x")]), msg(false, vec![]), msg(true, vec![tu("y")])] };
     assert_eq!(t.repair(), 2);
