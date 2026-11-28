@@ -816,10 +816,88 @@ def test_startup_errors():
     check(p.returncode == 0 and p.stdout.startswith("barb "), "version")
 
 
+def test_sessions():
+    d = tempfile.mkdtemp()
+    sd = os.path.join(d, ".barb", "sessions")
+    def thinking(t, say):
+        return {"type": "message", "role": "assistant", "stop_reason": "end_turn", "usage": {"input_tokens": 5, "output_tokens": 5},
+                "content": [{"type": "thinking", "thinking": t, "signature": "s"}, {"type": "text", "text": say}]}
+    fake = Fake([text("Noted."), text("It was 42."), text("Still 42."), text("fresh"), text("unsaved"), text("hi back"),
+                 thinking("deep thought here", "Thought about it.")])
+    p, _ = run(fake, ["-p", "remember 42", "-m", "saved-model"], d)
+    check(p.returncode == 0, f"exit {p.returncode}: {p.stderr}")
+    files = sorted(os.listdir(sd)) if os.path.isdir(sd) else []
+    check(len(files) == 1 and re.fullmatch(r"\d{8}-\d{6}\.json", files[0] if files else ""), f"one saved conversation: {files}")
+    gi = os.path.join(d, ".barb", ".gitignore")
+    check(os.path.exists(gi) and open(gi).read().rstrip().endswith("*"), ".barb/ keeps itself out of git")
+    name = files[0][:-5] if files else "none"
+    saved = json.load(open(os.path.join(sd, files[0]), encoding="utf-8")) if files else {}
+    check(saved.get("barb_session") == 1 and saved.get("model") == "saved-model" and len(saved.get("messages", [])) == 2,
+          f"the file: {saved}")
+
+    # -c takes up the newest, with the model it was saved with, and goes on in the same file.
+    p, _ = run(fake, ["-c", "-p", "what was it?"], d)
+    check(p.returncode == 0 and p.stdout == "It was 42.\n", f"exit {p.returncode}: {p.stdout!r} {p.stderr}")
+    if len(fake.requests) >= 2:
+        r = fake.requests[1]
+        check(r["model"] == "saved-model", f"model {r['model']}")
+        check(r["messages"][0]["content"][0]["text"] == "remember 42", "the old conversation is sent")
+        check(any("being resumed" in t for t in last_user_texts(r)) and last_user_texts(r)[-1] == "what was it?", f"{last_user_texts(r)}")
+    check(sorted(os.listdir(sd)) == files, "no new file")
+    check(len(json.load(open(os.path.join(sd, files[0]), encoding="utf-8"))["messages"]) == 4, "the file grew")
+
+    # -r by name, and -m wins over the saved model.
+    p, _ = run(fake, ["-r", name, "-m", "other", "-p", "again"], d)
+    check(p.returncode == 0 and len(fake.requests) == 3 and fake.requests[2]["model"] == "other", f"-r: {p.stderr}")
+    # --no-save: nothing new on disk
+    p, _ = run(fake, ["--no-save", "-p", "x"], d)
+    check(p.returncode == 0 and sorted(os.listdir(sd)) == files, f"--no-save: {os.listdir(sd)}")
+    # -c takes the newest even when an older one sorts first; with --no-save it leaves the file alone.
+    old = os.path.join(sd, "19990101-000000.json")
+    with open(old, "w") as f:
+        json.dump({"barb_session": 1, "messages": [{"role": "user", "content": [{"type": "text", "text": "ancient"}]}]}, f)
+    os.utime(old, (946684800, 946684800))
+    before = open(os.path.join(sd, files[0]), "rb").read()
+    p, _ = run(fake, ["-c", "--no-save", "-p", "y"], d)
+    check(p.returncode == 0 and fake.requests[-1]["messages"][0]["content"][0]["text"] == "remember 42", f"-c took the newest: {p.stderr}")
+    check(open(os.path.join(sd, files[0]), "rb").read() == before, "-c --no-save leaves the file as it was")
+    os.remove(old)
+
+    # --sessions lists them and needs no key.
+    bare = {k: v for k, v in os.environ.items() if k.upper() in ("PATH", "SYSTEMROOT")}
+    p = subprocess.run([BARB, "--sessions"], cwd=d, env=bare, capture_output=True, **TEXT)
+    check(p.returncode == 0 and name in p.stdout and "6 messages" in p.stdout and "remember 42" in p.stdout, f"--sessions: {p.stdout!r}")
+    e = tempfile.mkdtemp()
+    p = subprocess.run([BARB, "--sessions"], cwd=e, env=bare, capture_output=True, **TEXT)
+    check(p.returncode == 0 and "No saved conversations" in p.stdout, f"--sessions, none: {p.stdout!r}")
+    p, _ = run(fake, ["-c", "-p", "x"], e)
+    check(p.returncode == 2 and "no saved conversation" in p.stderr, f"-c with none: {p.stderr!r}")
+    p, _ = run(fake, ["-r", "nope", "-p", "x"], d)
+    check(p.returncode == 2 and "cannot read .barb/sessions/nope.json" in p.stderr, f"-r nope: {p.stderr!r}")
+    with open(os.path.join(e, "junk.json"), "w") as f: f.write("{}")
+    p, _ = run(fake, ["-r", "./junk.json", "-p", "x"], e)
+    check(p.returncode == 2 and "is not a saved Barb conversation" in p.stderr, f"-r junk: {p.stderr!r}")
+    n = len(fake.requests)
+    check(n == 5, f"{n} requests: no failed start asked the model")
+
+    # Interactive: a new one says where it went; -c shows the old one again; -v shows thinking.
+    code, out, left = pty_session([BARB, "--yes"], e, env_for(fake), [("> ", "hello there\n"), ("hi back", "\x04")])
+    check(not left and code == 0, f"new interactive session; left {[x[0] for x in left]}: {out!r}")
+    m = re.search(r"Saved as (\S+);", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", out))
+    check(m is not None and os.path.exists(os.path.join(e, ".barb", "sessions", (m.group(1) if m else "") + ".json")), f"told where: {out[-300:]!r}")
+    code, out, left = pty_session([BARB, "--yes", "-c", "-v"], e, env_for(fake), [("hi back", "think\n"), ("Thought about it.", "\x04")])
+    plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", out)
+    check(not left and code == 0, f"resumed interactive session; left {[x[0] for x in left]}: {out!r}")
+    check("> hello there" in plain, f"the old conversation is shown again: {plain!r}")
+    check("deep thought here" in plain, "with -v the thinking is shown")
+    no_problems(fake, "sessions")
+    fake.stop()
+
+
 if __name__ == "__main__":
     for t in (test_startup_errors, test_files_and_bash, test_key_not_inherited, test_background_wake, test_timeout_and_interrupt,
               test_leftovers_killed, test_permissions_and_errors, test_interactive_pipe, test_interactive_interrupt, test_interactive_permissions,
-              test_one_key_typeahead, test_line_editing, test_paste, test_suspend, test_instructions):
+              test_one_key_typeahead, test_line_editing, test_paste, test_suspend, test_instructions, test_sessions):
         t()
     print(f"e2e: {checks} checks, {failed} failed")
     sys.exit(1 if failed else 0)

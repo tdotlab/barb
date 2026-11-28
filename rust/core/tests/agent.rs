@@ -81,6 +81,19 @@ struct World {
     exit_code: i32,
     /// Shown when a check fails (the chaos test's seed).
     ctx: String,
+    /// Writes fail with Denied.
+    fail_writes: bool,
+}
+
+fn test_cfg() -> Config {
+    Config {
+        model: b"claude-test".to_vec(),
+        cwd: b"/work".to_vec(),
+        platform: b"TestOS".to_vec(),
+        date: b"2026-11-21".to_vec(),
+        auto_approve: true,
+        ..Config::default()
+    }
 }
 
 fn s(b: &[u8]) -> String {
@@ -131,7 +144,12 @@ impl World {
             auto_approve,
             max_turns,
             instructions,
+            session: Vec::new(),
+            verbose: false,
         };
+        World::with(cfg)
+    }
+    fn with(cfg: Config) -> World {
         World {
             g: Agent::new(cfg),
             q: VecDeque::new(),
@@ -152,7 +170,16 @@ impl World {
             done: false,
             exit_code: 0,
             ctx: String::new(),
+            fail_writes: false,
         }
+    }
+    /// A world whose conversation is saved to `path`.
+    fn saving(path: &str) -> World {
+        let mut w = World::new(true);
+        let mut cfg = test_cfg();
+        cfg.session = path.as_bytes().to_vec();
+        w.g = Agent::new(cfg);
+        w
     }
     fn new(auto_approve: bool) -> World {
         World::new_cfg(auto_approve, 0, false)
@@ -287,6 +314,10 @@ impl World {
                 o.a = path.clone();
                 o.c = s(&data);
                 if self.hold_fs {
+                    return;
+                }
+                if self.fail_writes {
+                    self.q.push_back(Ev::File { id, status: Fs::Denied, data: vec![] });
                     return;
                 }
                 self.put_file(&path, Some(&data));
@@ -1486,12 +1517,23 @@ const ANS_ALL: [Answer; 3] = [Answer::No, Answer::Yes, Answer::Always];
 #[test]
 fn random_events() {
     let mut total_requests = 0;
+    let mut resumed = 0;
     for seed in 1..=400u32 {
         let mut r = Rnd(seed.wrapping_mul(7919));
         let auto = r.n(2) == 1;
         let turns = 1 + r.n(8);
         let instr = r.n(2) == 1;
         let mut w = World::new_cfg(auto, turns, instr);
+        let saving = r.n(2) == 1;
+        if saving {
+            let mut cfg = test_cfg();
+            cfg.auto_approve = auto;
+            cfg.max_turns = turns;
+            cfg.instructions = instr;
+            cfg.session = b"s.json".to_vec();
+            cfg.verbose = r.n(2) == 1;
+            w.g = Agent::new(cfg);
+        }
         w.ctx = format!("seed {seed}");
         w.put("f.txt", "x\nx\n");
         if r.n(2) == 1 {
@@ -1550,7 +1592,258 @@ fn random_events() {
             }
         }
         total_requests += w.bodies.len();
+        // Whatever state it was saved in, a saved conversation can be taken up again, and the
+        // request that follows keeps the API's rules (check_body runs on it).
+        let saved: Vec<String> = w.ops.iter().filter(|o| o.kind == Kind::Write && o.a == "s.json").map(|o| o.c.clone()).collect();
+        if let Some(last) = saved.last() {
+            let mut v = World::new(true);
+            v.ctx = format!("seed {seed}, resumed");
+            let acts = v.g.resume(last.as_bytes(), true).expect("a saved conversation loads");
+            for a in acts {
+                v.act(a);
+            }
+            v.reply_text("back");
+            v.input("go on");
+            assert_eq!(v.bodies.len(), 1, "{}", v.ctx);
+            resumed += 1;
+        }
     }
+    assert!(resumed > 50, "only {resumed} saved conversations resumed");
     // the chaos did get as far as asking the model, a lot
     assert!(total_requests > 400, "only {total_requests} requests");
+}
+
+// ---- saved conversations ----
+
+fn writes_to<'a>(w: &'a World, path: &str) -> Vec<&'a Op> {
+    w.ops.iter().filter(|o| o.kind == Kind::Write && o.a == path).collect()
+}
+
+#[test]
+fn saves_as_it_goes() {
+    let mut w = World::saving(".barb/sessions/t.json");
+    w.hold_http = true;
+    w.input("hello");
+    // the user's message is saved before the model answers
+    let f = w.file(".barb/sessions/t.json").expect("saved");
+    assert!(f.starts_with("{\"barb_session\":1,\"model\":\"claude-test\",\"cwd\":\"/work\",\"messages\":["), "{f}");
+    assert!(f.contains("hello") && !f.contains("cache_control"), "{f}");
+    let id = w.last_op(Kind::Http);
+    w.hold_http = false;
+    let r = mk_reply("tool_use", &format!("[{{\"type\":\"text\",\"text\":\"looking\"}},{}]", tool("t1", "bash", r#"{"command":"echo hi"}"#)));
+    w.reply_text("done");
+    w.procs.push(("echo", b"hi\n".to_vec(), 0, 0));
+    w.http(id, 200, &r);
+    let f = w.file(".barb/sessions/t.json").unwrap();
+    assert!(f.contains("done") && f.contains("tool_result") && f.contains("looking"), "{f}");
+    // one save per request and one per reply: request, reply (tool_use), request, reply
+    assert_eq!(writes_to(&w, ".barb/sessions/t.json").len(), 4);
+    // a retry does not save again
+    let n = writes_to(&w, ".barb/sessions/t.json").len();
+    w.reply(OVERLOADED, 529);
+    w.reply_text("ok");
+    w.input("more");
+    let t = w.last_op(Kind::Timer);
+    w.timer(t);
+    assert_eq!(writes_to(&w, ".barb/sessions/t.json").len(), n + 2, "request and reply, not the retry");
+    // an interrupt is saved as soon as it happens: while the model is asked...
+    let mut w = World::saving("i.json");
+    w.hold_http = true;
+    w.input("first");
+    w.interrupt();
+    assert!(w.file("i.json").unwrap().contains("The user interrupted you here"));
+    // ...and while tools run, with every call answered in the file
+    let mut w = World::saving("j.json");
+    w.hold_proc = true;
+    w.reply_tools(&[tool("b1", "bash", r#"{"command":"sleep 100"}"#), tool("b2", "bash", r#"{"command":"echo never"}"#)]);
+    w.input("go");
+    w.interrupt();
+    let f = w.file("j.json").unwrap();
+    assert!(f.contains("Interrupted by the user") && f.contains("Not run: the user interrupted."), "{f}");
+
+    // nothing is saved for a conversation that never started
+    let mut w = World::saving("x.json");
+    w.input("/help");
+    w.eof();
+    assert!(writes_to(&w, "x.json").is_empty());
+    // and nothing at all without a file to save to
+    let mut w = World::new(true);
+    w.reply_text("hi");
+    w.input("hello");
+    assert!(w.ops.iter().all(|o| o.kind != Kind::Write));
+}
+
+#[test]
+fn a_failed_save_is_said_once() {
+    let mut w = World::saving("ro/t.json");
+    w.fail_writes = true;
+    w.reply_text("one");
+    w.reply_text("two");
+    w.input("a");
+    w.input("b");
+    let errs: Vec<_> = w.says.iter().filter(|x| x.0 == Style::Error).collect();
+    assert_eq!(errs.len(), 1, "{:?}", w.says);
+    assert!(errs[0].1.starts_with("Could not save the conversation to ro/t.json"), "{}", errs[0].1);
+    assert_eq!(w.bodies.len(), 2, "the conversation goes on");
+}
+
+#[test]
+fn clear_starts_a_new_file() {
+    let mut w = World::saving("d/t.json");
+    w.reply_text("one");
+    w.input("first");
+    assert_eq!(w.g.session_path(), b"d/t.json");
+    w.input("/clear");
+    w.input("/clear"); // nothing said since: still the same next file
+    assert_eq!(w.g.session_path(), b"d/t-2.json");
+    w.reply_text("two");
+    w.input("second");
+    assert!(w.file("d/t.json").unwrap().contains("first"));
+    let f = w.file("d/t-2.json").unwrap();
+    assert!(f.contains("second") && !f.contains("first"), "{f}");
+    w.input("/clear");
+    assert_eq!(w.g.session_path(), b"d/t-3.json");
+}
+
+/// A session file with these messages (JSON, comma-separated).
+fn session_file(msgs: &str) -> String {
+    format!("{{\"barb_session\":1,\"model\":\"m\",\"cwd\":\"/work\",\"messages\":[{msgs}]}}")
+}
+
+#[test]
+fn resume() {
+    let file = session_file(concat!(
+        r#"{"role":"user","content":[{"type":"text","text":"fix the build"}]},"#,
+        r#"{"role":"assistant","content":[{"type":"thinking","thinking":"plan it","signature":"x"},{"type":"text","text":"Looking."},"#,
+        r#"{"type":"tool_use","id":"t1","name":"read_file","input":{"path":"Makefile"}}]},"#,
+        r#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"all:"},{"type":"text","text":"[barb] Background task 1 finished"}]},"#,
+        r#"{"role":"assistant","content":[{"type":"text","text":"Fixed."}]}"#
+    ));
+    let mut w = World::new(true);
+    for a in w.g.resume(file.as_bytes(), true).expect("loads") {
+        w.act(a);
+    }
+    let shown: Vec<(Style, &str)> = w.says.iter().map(|x| (x.0, x.1.as_str())).collect();
+    assert_eq!(
+        shown,
+        [(Style::User, "fix the build"), (Style::Assistant, "Looking."), (Style::Tool, "read_file Makefile"), (Style::Assistant, "Fixed.")],
+        "the [barb] note and the tool result are not shown; thinking only with verbose"
+    );
+    assert!(w.ops.is_empty(), "resuming does nothing else");
+    w.reply_text("ok");
+    w.input("and the tests");
+    let b = w.last_body().to_string();
+    assert!(b.contains("fix the build") && b.contains("plan it") && b.contains("Fixed."), "{b}");
+    assert!(b.contains("\"text\":\"[barb] This conversation was saved and is being resumed now."), "{b}");
+    let note = b.find("being resumed").unwrap();
+    assert!(note < b.find("and the tests").unwrap(), "the note comes before what the user typed");
+    assert!(!b.contains("It was saved in"), "same directory");
+    // the note is said once
+    w.reply_text("ok");
+    w.input("again");
+    assert_eq!(w.last_body().matches("being resumed").count(), 1);
+
+    // /clear forgets the note with the conversation
+    let mut w = World::new(true);
+    w.g.resume(file.as_bytes(), false).unwrap();
+    w.input("/clear");
+    w.reply_text("ok");
+    w.input("new topic");
+    assert!(!w.last_body().contains("being resumed"), "{}", w.last_body());
+
+    // Not shown again: nothing said
+    let mut w = World::new(true);
+    assert!(w.g.resume(file.as_bytes(), false).unwrap().is_empty());
+    // Not a session file: refused
+    assert!(w.g.resume(b"{\"messages\":[]}", true).is_none());
+    assert!(w.g.resume(b"not json", true).is_none());
+}
+
+#[test]
+fn resume_shows_thinking_when_verbose_and_only_the_last_messages() {
+    let mut cfg = test_cfg();
+    cfg.verbose = true;
+    let mut w = World::with(cfg);
+    let mut msgs = Vec::new();
+    for i in 0..30 {
+        msgs.push(format!(r#"{{"role":"user","content":[{{"type":"text","text":"q{i}"}}]}}"#));
+        msgs.push(format!(r#"{{"role":"assistant","content":[{{"type":"thinking","thinking":"t{i}","signature":"x"}},{{"type":"redacted_thinking","data":"zz"}},{{"type":"text","text":"a{i}"}}]}}"#));
+    }
+    for a in w.g.resume(session_file(&msgs.join(",")).as_bytes(), true).unwrap() {
+        w.act(a);
+    }
+    assert_eq!(w.says[0], (Style::Info, "(20 earlier messages not shown)".to_string()));
+    assert_eq!(w.says[1], (Style::User, "q10".to_string()));
+    assert_eq!(w.says[2], (Style::Thinking, "t10".to_string()));
+    assert_eq!(w.says[3], (Style::Thinking, "[redacted thinking]".to_string()));
+    assert_eq!(w.says[4], (Style::Assistant, "a10".to_string()));
+    assert!(!w.said("q9"));
+}
+
+#[test]
+fn resume_after_a_crash_mid_tools() {
+    // Closed while two tools ran: the reply with the calls was saved, the results were not.
+    let file = session_file(concat!(
+        r#"{"role":"user","content":[{"type":"text","text":"go"}]},"#,
+        r#"{"role":"assistant","content":[{"type":"tool_use","id":"a","name":"bash","input":{"command":"make","description":"Build"}},"#,
+        r#"{"type":"tool_use","id":"b","name":"bash","input":{"command":"sleep 9\nmore","run_in_background":true}}]}"#
+    ));
+    let mut w = World::new(true);
+    for a in w.g.resume(file.as_bytes(), true).unwrap() {
+        w.act(a);
+    }
+    assert!(w.says.contains(&(Style::Tool, "bash Build".to_string())));
+    assert!(w.says.contains(&(Style::Tool, "bash (background) sleep 9".to_string())), "{:?}", w.says);
+    w.reply_text("ok");
+    w.input("what happened?");
+    assert_eq!(w.bodies.len(), 1); // check_body: every tool_use has its result
+    let (r, err) = w.result_of("a").unwrap();
+    assert!(err && r.contains("Barb was closed"), "{r}");
+    assert!(w.result_of("b").unwrap().1);
+}
+
+#[test]
+fn resume_in_another_directory() {
+    let file = session_file(r#"{"role":"user","content":[{"type":"text","text":"hi"}]}"#).replace("/work", "/old");
+    let mut w = World::new(true);
+    for a in w.g.resume(file.as_bytes(), false).unwrap() {
+        w.act(a);
+    }
+    assert!(w.said("(this conversation was saved in /old)"));
+    w.reply_text("ok");
+    w.input("still there?");
+    let b = w.last_body();
+    assert!(b.contains("It was saved in /old; the working directory is now /work."), "{b}");
+    // the unanswered message and the new one go together, as one user message
+    assert!(b.contains("\"text\":\"hi\"},{\"type\":\"text\",\"text\":\"[barb] This conversation"), "{b}");
+}
+
+#[test]
+fn verbose_shows_thinking() {
+    let c = "[{\"type\":\"thinking\",\"thinking\":\"  let me see\\n\",\"signature\":\"s\"},{\"type\":\"text\",\"text\":\"Answer.\"}]";
+    let mut w = World::new(true);
+    w.reply(&mk_reply("end_turn", c), 200);
+    w.input("q");
+    assert!(!w.says.iter().any(|x| x.0 == Style::Thinking), "hidden by default");
+    w.input("/verbose");
+    assert!(w.said("Verbose: the model's thinking is shown."));
+    w.reply(&mk_reply("end_turn", c), 200);
+    w.input("q2");
+    let t: Vec<_> = w.says.iter().filter(|x| x.0 == Style::Thinking).collect();
+    assert_eq!(t.len(), 1);
+    assert_eq!(t[0].1, "let me see", "trimmed");
+    let i = w.says.iter().position(|x| x.0 == Style::Thinking).unwrap();
+    assert_eq!(w.says[i + 1], (Style::Assistant, "Answer.".to_string()), "before the reply it led to");
+    w.input("/verbose");
+    assert!(w.said("Verbose off"));
+    w.reply(&mk_reply("end_turn", c), 200);
+    w.input("q3");
+    assert_eq!(w.says.iter().filter(|x| x.0 == Style::Thinking).count(), 1);
+    // empty thinking (some APIs send it) shows nothing
+    let mut cfg = test_cfg();
+    cfg.verbose = true;
+    let mut w = World::with(cfg);
+    w.reply(&mk_reply("end_turn", "[{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"s\"},{\"type\":\"text\",\"text\":\"A\"}]"), 200);
+    w.input("q");
+    assert!(!w.says.iter().any(|x| x.0 == Style::Thinking));
 }

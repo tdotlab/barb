@@ -237,6 +237,25 @@ fn answered(g: &mut Agent, a: Answer, bit: u32) -> R {
     }
 }
 
+/// The line a tool call is shown as ("read_file src/main.rs"), from its name and input: for a
+/// call that is shown again, when a saved conversation is resumed.
+pub(crate) fn label(name: &[u8], input: &[u8]) -> Bytes {
+    let s = |k: &str| json::get(input, k).and_then(json::as_str).unwrap_or_default();
+    let mut b = name.to_vec();
+    match name {
+        b"read_file" | b"edit_file" | b"write_file" => push!(b; " ", s("path")),
+        b"bash" => {
+            let bg = json::get(input, "run_in_background").and_then(json::as_bool) == Some(true);
+            let desc = s("description");
+            let cmd = s("command");
+            push!(b; " ", if bg { "(background) " } else { "" });
+            push!(b; if desc.is_empty() { text::first_line(&cmd, 100) } else { &desc[..] });
+        }
+        _ => {}
+    }
+    b
+}
+
 fn say_tool(g: &mut Agent, name: &str, what: &[u8]) {
     let t = cat!(name, " ", what);
     g.say(Style::Tool, t);

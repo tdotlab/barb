@@ -163,6 +163,14 @@ pub fn request(cfg: &Cfg, t: &Transcript) -> Vec<u8> {
         w.key("tools");
         w.raw(cfg.tools);
     }
+    write_messages(&mut w, t, last);
+    w.obj_end();
+    debug_assert!(!w.bad);
+    w.out
+}
+
+/// "messages": the transcript, with the cache breakpoint on block `cache_at` (message, block).
+fn write_messages(w: &mut Writer, t: &Transcript, cache_at: Option<(usize, usize)>) {
     w.key("messages");
     w.arr();
     for (mi, m) in t.msgs.iter().enumerate() {
@@ -178,17 +186,146 @@ pub fn request(cfg: &Cfg, t: &Transcript) -> Vec<u8> {
             if !b.emittable() {
                 continue;
             }
-            let cache = last == Some((mi, bi))
+            let cache = cache_at == Some((mi, bi))
                 && matches!(b, Block::Text(_) | Block::ToolResult { .. });
-            emit_block(&mut w, b, cache);
+            emit_block(w, b, cache);
         }
         w.arr_end();
         w.obj_end();
     }
     w.arr_end();
+}
+
+// ---- saved sessions ----
+//
+// A session file is one JSON object (the format is in docs/SESSIONS.md, shared with the C
+// version): {"barb_session": 1, "model": ..., "cwd": ..., "messages": [...]}, where "messages"
+// is exactly what a request would send, without the cache marks.
+
+pub const SESSION_VERSION: i64 = 1;
+
+/// What a session file holds.
+#[derive(Clone, Debug, Default)]
+pub struct Session {
+    pub model: Vec<u8>,
+    pub cwd: Vec<u8>,
+    pub tr: Transcript,
+}
+
+/// The session file for this conversation.
+pub fn session(model: &[u8], cwd: &[u8], t: &Transcript) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.obj();
+    w.key("barb_session");
+    w.int(SESSION_VERSION);
+    w.key("model");
+    w.str(model);
+    w.key("cwd");
+    w.str(cwd);
+    write_messages(&mut w, t, None);
     w.obj_end();
     debug_assert!(!w.bad);
     w.out
+}
+
+/// Read a session file. None if it is not one (not JSON, the wrong shape, a newer version).
+pub fn load_session(data: &[u8]) -> Option<Session> {
+    if !json::valid(data) {
+        return None;
+    }
+    let v = json::as_int(json::get(data, "barb_session")?)?;
+    if !(1..=SESSION_VERSION).contains(&v) {
+        return None;
+    }
+    let mut s = Session {
+        model: get_str(data, "model").unwrap_or_default(),
+        cwd: get_str(data, "cwd").unwrap_or_default(),
+        tr: Transcript::default(),
+    };
+    let mut j = Reader::new(json::get(data, "messages")?);
+    if j.next() != Tok::Arr {
+        return None;
+    }
+    loop {
+        let t = j.next();
+        if t == Tok::ArrEnd {
+            break;
+        }
+        if t != Tok::Obj {
+            return None;
+        }
+        let el = j.capture(t)?;
+        let role = get_str(el, "role")?;
+        let mut m = Msg { assistant: role == b"assistant", blocks: Vec::new() };
+        if !m.assistant && role != b"user" {
+            return None;
+        }
+        parse_content(json::get(el, "content")?, &mut m)?;
+        s.tr.msgs.push(m);
+    }
+    s.tr.repair();
+    Some(s)
+}
+
+impl Transcript {
+    /// Make a transcript that was cut off (Barb was closed while tools ran, or a file was edited
+    /// by hand) one the API accepts: every tool_use gets a tool_result at the start of the next
+    /// user message, and empty messages go. The number of results added.
+    pub fn repair(&mut self) -> usize {
+        self.msgs.retain(|m| m.blocks.iter().any(Block::emittable));
+        // Two messages of one side in a row (one between them was empty) become one.
+        let mut i = 1;
+        while i < self.msgs.len() {
+            if self.msgs[i].assistant == self.msgs[i - 1].assistant {
+                let m = self.msgs.remove(i);
+                self.msgs[i - 1].blocks.extend(m.blocks);
+            } else {
+                i += 1;
+            }
+        }
+        let mut added = 0;
+        let mut i = 0;
+        while i < self.msgs.len() {
+            if !self.msgs[i].assistant {
+                i += 1;
+                continue;
+            }
+            let ids: Vec<Vec<u8>> = self.msgs[i]
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    Block::ToolUse { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect();
+            if ids.is_empty() {
+                i += 1;
+                continue;
+            }
+            if !matches!(self.msgs.get(i + 1), Some(m) if !m.assistant) {
+                self.msgs.insert(i + 1, Msg { assistant: false, blocks: Vec::new() });
+            }
+            let next = &mut self.msgs[i + 1];
+            let mut k = 0;
+            for id in ids {
+                let has = next.blocks.iter().any(|b| matches!(b, Block::ToolResult { id: r, .. } if *r == id));
+                if !has {
+                    next.blocks.insert(
+                        k,
+                        Block::ToolResult {
+                            id,
+                            content: b"Not run: Barb was closed before this tool call finished.".to_vec(),
+                            is_error: true,
+                        },
+                    );
+                    k += 1;
+                    added += 1;
+                }
+            }
+            i += 2;
+        }
+        added
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -241,6 +378,14 @@ fn parse_content(content: &[u8], m: &mut Msg) -> Option<()> {
                 let input = json::get(el, "input").unwrap_or(b"{}").to_vec();
                 m.blocks.push(Block::ToolUse { id, name, input });
             }
+            b"tool_result" => match json::get(el, "content").and_then(json::as_str) {
+                Some(content) => m.blocks.push(Block::ToolResult {
+                    id: get_str(el, "tool_use_id")?,
+                    content,
+                    is_error: json::get(el, "is_error").and_then(json::as_bool).unwrap_or(false),
+                }),
+                None => m.blocks.push(Block::Raw(el.to_vec())),
+            },
             _ => m.blocks.push(Block::Raw(el.to_vec())),
         }
     }

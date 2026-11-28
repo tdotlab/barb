@@ -22,7 +22,8 @@ not meant to match the Rust one feature for feature.
 
 The design: a core that does no I/O (`step(event) -> actions`), a screen that turns events and
 actions into bytes, and a thin platform layer for each system. The rules the conversation keeps,
-the six tools, the plain output formats that scripts read, the command line and the settings. Each
+the six tools, the plain output formats that scripts read, the command line and the settings, and
+the format of a saved conversation (`SESSIONS.md`), so either version can take up the other's. Each
 version's `ARCHITECTURE.md` describes its own code, and the two read nearly alike.
 
 ## Where they differ
@@ -34,7 +35,8 @@ version's `ARCHITECTURE.md` describes its own code, and the two read nearly alik
 | Tests | `make test` (sanitizers), `build.cmd test` | `python3 tools/test.py` |
 | Memory | arenas; a failed allocation is reported and survived, and a test fails every allocation in turn | the global allocator; a failed allocation aborts, and input sizes are bounded instead (8 MiB reads, head-and-tail command output, a JSON nesting limit) |
 | `unsafe` | all of it, by nature | only in the platform modules, each block with a `SAFETY` comment; `core` and `ui` forbid it |
-| Size | about 8,200 lines | about 10,900 lines, many of them tests in the same files as the code |
+| Saved conversations, verbose | not yet | `-c`, `-r`, `--sessions`; `-v`, `/verbose` |
+| Size | about 8,200 lines | about 11,500 lines, many of them tests in the same files as the code |
 
 ## The port, briefly
 

@@ -23,6 +23,7 @@
 //! The tools are in tools.rs.
 
 use crate::api::{self, Block, Reply, Transcript};
+use crate::json;
 use crate::text::{self, Bytes};
 use crate::tools::{self, Tc};
 use alloc::vec::Vec;
@@ -93,6 +94,11 @@ pub enum Style {
     /// The token count after each reply: a platform with a status line can show it there instead
     /// of printing it, and one without can treat it as Info.
     Usage,
+    /// What the user said, shown again when a saved conversation is resumed (what they type is
+    /// already on the screen).
+    User,
+    /// The model's thinking, shown only with `verbose`.
+    Thinking,
 }
 
 /// Something for the platform to do.
@@ -137,6 +143,11 @@ pub struct Config {
     /// Before the first request, read AGENTS.md (or else CLAUDE.md) from the working directory,
     /// with the files its "@file" lines name, into the system prompt.
     pub instructions: bool,
+    /// Save the conversation to this file (see docs/SESSIONS.md) each time it changes; empty for
+    /// not at all. After /clear it goes on in "<name>-2.json", "-3", and so on.
+    pub session: Bytes,
+    /// Show the model's thinking (Style::Thinking). /verbose turns it on and off.
+    pub verbose: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -243,8 +254,19 @@ pub struct Agent {
     /// The last model call ended in an API error (the exit status when we finish).
     failed: bool,
 
+    /// Saves in flight; whether a failed one has been reported; how many times /clear has started
+    /// a new file.
+    save_ops: Vec<i64>,
+    save_warned: bool,
+    clears: u32,
+    /// Said to the model at the start of the next user message, after a resume.
+    resume_note: Bytes,
+
     acts: Vec<Action>,
 }
+
+/// How many messages of a resumed conversation are shown again.
+const REPLAY_MSGS: usize = 40;
 
 /// The "@path" line `line`, or None.
 fn import_of(line: &[u8]) -> Option<&[u8]> {
@@ -312,6 +334,10 @@ impl Agent {
             eof: false,
             done: false,
             failed: false,
+            save_ops: Vec::new(),
+            save_warned: false,
+            clears: 0,
+            resume_note: Vec::new(),
             acts: Vec::new(),
         };
         g.system = g.build_system();
@@ -325,6 +351,7 @@ impl Agent {
                 Event::Input(line) => self.on_input(line),
                 Event::Eof => self.eof = true,
                 Event::Http { id, status, body, note } => self.on_http(id, status, body, note),
+                Event::File { id, status, note, .. } if self.save_ops.contains(&id) => self.on_saved(id, status, note),
                 Event::File { id, status, data, .. } => {
                     if self.state == State::Load && self.ld.op != 0 && id == self.ld.op {
                         self.on_load(status, data);
@@ -340,6 +367,115 @@ impl Agent {
             self.settle();
         }
         core::mem::take(&mut self.acts)
+    }
+
+    /// Take up a saved conversation (a session file's contents), before any other event. With
+    /// `show`, what was said is shown again (the last messages of it). None if `data` is not a
+    /// session file; the agent is unchanged then.
+    pub fn resume(&mut self, data: &[u8], show: bool) -> Option<Vec<Action>> {
+        let s = api::load_session(data)?;
+        self.tr = s.tr;
+        if show {
+            self.replay();
+        }
+        let mut note = cat!(
+            "[barb] This conversation was saved and is being resumed now. Files may have changed since, ",
+            "so read a file again before you edit it."
+        );
+        if !s.cwd.is_empty() && s.cwd != self.cfg.cwd {
+            push!(note; " It was saved in ", s.cwd, "; the working directory is now ", self.cfg.cwd, ".");
+            let t = cat!("(this conversation was saved in ", s.cwd, ")");
+            self.say(Style::Info, t);
+        }
+        self.resume_note = note;
+        Some(core::mem::take(&mut self.acts))
+    }
+
+    /// Show the last REPLAY_MSGS messages again: what the user said, the replies, and a line for
+    /// each tool call, as they looked when they happened.
+    fn replay(&mut self) {
+        let n = self.tr.msgs.len();
+        let from = n.saturating_sub(REPLAY_MSGS);
+        if from > 0 {
+            let t = cat!("(", from, " earlier messages not shown)");
+            self.say(Style::Info, t);
+        }
+        let msgs = core::mem::take(&mut self.tr.msgs);
+        for m in &msgs[from..] {
+            for b in &m.blocks {
+                match b {
+                    Block::Text(t) if !m.assistant => {
+                        if !t.starts_with(b"[barb]") {
+                            self.say(Style::User, t.clone());
+                        }
+                    }
+                    Block::Text(t) => self.say(Style::Assistant, t.clone()),
+                    Block::ToolUse { name, input, .. } => {
+                        let t = tools::label(name, input);
+                        self.say(Style::Tool, t);
+                    }
+                    Block::Raw(j) => self.say_thinking(j),
+                    Block::ToolResult { .. } => {}
+                }
+            }
+        }
+        self.tr.msgs = msgs;
+    }
+
+    /// With verbose on, show a thinking block (a Raw block of type thinking or redacted_thinking).
+    fn say_thinking(&mut self, raw: &[u8]) {
+        if !self.cfg.verbose {
+            return;
+        }
+        let Some(kind) = json::get(raw, "type").and_then(json::as_str) else { return };
+        if kind == b"thinking" {
+            if let Some(t) = json::get(raw, "thinking").and_then(json::as_str) {
+                let t = text::trim(&t);
+                if !t.is_empty() {
+                    self.say(Style::Thinking, t.to_vec());
+                }
+            }
+        } else if kind == b"redacted_thinking" {
+            self.say(Style::Thinking, "[redacted thinking]");
+        }
+    }
+
+    // ---- saving the conversation ----
+
+    /// The file this conversation is saved to now: the configured one, or after /clear its
+    /// "-2", "-3", ... sibling.
+    pub fn session_path(&self) -> Bytes {
+        let p = &self.cfg.session;
+        if self.clears == 0 || p.is_empty() {
+            return p.clone();
+        }
+        let stem = p.strip_suffix(b".json").unwrap_or(p);
+        cat!(stem, "-", self.clears + 1, ".json")
+    }
+
+    fn save(&mut self) {
+        if self.cfg.session.is_empty() {
+            return;
+        }
+        let data = api::session(&self.cfg.model, &self.cfg.cwd, &self.tr);
+        let id = self.new_id();
+        self.save_ops.push(id);
+        let path = self.session_path();
+        self.emit(Action::Write { id, path, data });
+    }
+
+    fn on_saved(&mut self, id: i64, status: Fs, note: &[u8]) {
+        self.save_ops.retain(|&k| k != id);
+        if status == Fs::Ok || self.save_warned {
+            return;
+        }
+        self.save_warned = true;
+        let mut b = cat!("Could not save the conversation to ", self.session_path());
+        if !note.is_empty() {
+            push!(b; ": ", note);
+        }
+        push!(b; ". Barb tries again after each reply.");
+        self.say(Style::Error, b);
     }
 
     /// True while the agent is working on a turn (asking the model, running tools, reading the
@@ -383,7 +519,9 @@ impl Agent {
     /// Move the queued text into the last user message. True if any of it was the user's own.
     fn flush_notes(&mut self) -> bool {
         let notes = core::mem::take(&mut self.notes);
+        let resumed = core::mem::take(&mut self.resume_note);
         let u = self.tr.user_msg();
+        u.add_text(&resumed);
         let mut user = false;
         for n in notes {
             u.add_text(&n.text);
@@ -478,6 +616,7 @@ impl Agent {
         self.turns += 1;
         self.retries = 0;
         self.wait_said = false;
+        self.save();
         self.post_request();
     }
 
@@ -779,6 +918,7 @@ impl Agent {
         for b in &r.msg.blocks {
             match b {
                 Block::Text(t) => self.say(Style::Assistant, t.clone()),
+                Block::Raw(j) => self.say_thinking(j),
                 Block::ToolUse { id, name, input } => calls.push(Call {
                     id: id.clone(),
                     name: name.clone(),
@@ -799,6 +939,7 @@ impl Agent {
         self.emit(Action::Say { style: Style::Usage, text: u, tokens: total + r.out_tok });
         if !r.msg.blocks.is_empty() {
             self.tr.msgs.push(r.msg);
+            self.save();
         }
 
         let cut = r.stop_reason == b"max_tokens";
@@ -836,7 +977,7 @@ impl Agent {
         if line.first() != Some(&b'/') {
             return false;
         }
-        if [&b"/exit"[..], b"/quit", b"/clear", b"/help"].iter().any(|c| line.starts_with(c)) {
+        if [&b"/exit"[..], b"/quit", b"/clear", b"/help", b"/verbose"].iter().any(|c| line.starts_with(c)) {
             return true;
         }
         // One word starting with /: a mistyped command. With a space: a prompt that mentions a path.
@@ -854,15 +995,26 @@ impl Agent {
                     self.say(Style::Error, "Busy: wait for the current step, or press Ctrl-C, before /clear.");
                     return;
                 }
+                if !self.tr.msgs.is_empty() && !self.cfg.session.is_empty() {
+                    self.clears += 1; // the old conversation stays in its file
+                }
                 self.tr.msgs.clear();
                 self.notes.clear();
                 self.seen.clear();
+                self.resume_note.clear();
                 self.turns = 0;
                 self.say(Style::Info, "Conversation cleared. Background tasks and timers are still running.");
             }
+            b"/verbose" => {
+                self.cfg.verbose = !self.cfg.verbose;
+                self.say(
+                    Style::Info,
+                    if self.cfg.verbose { "Verbose: the model's thinking is shown." } else { "Verbose off: thinking is hidden." },
+                );
+            }
             b"/help" => self.say(
                 Style::Info,
-                "/clear  forget the conversation\n/exit   quit (also Ctrl-D)\nCtrl-C  stop what is running; twice at the prompt to quit",
+                "/clear    forget the conversation (a saved one stays saved)\n/verbose  show or hide the model's thinking\n/exit     quit (also Ctrl-D)\nCtrl-C    stop what is running; twice at the prompt to quit",
             ),
             _ => {
                 let t = cat!("Unknown command ", line, ". Try /help.");
@@ -900,6 +1052,7 @@ impl Agent {
                 // user types next joins it. Say what happened, or the model takes up the old
                 // request as if nothing had.
                 self.tr.user_msg().add_text(b"[barb] The user interrupted you here, before you replied.");
+                self.save();
                 self.say(Style::Info, "Interrupted.");
             }
             State::Load => {
@@ -930,6 +1083,7 @@ impl Agent {
                 }
                 self.tc = Tc::done();
                 self.complete_round(false);
+                self.save();
                 self.say(Style::Info, "Interrupted.");
             }
             State::Idle => {

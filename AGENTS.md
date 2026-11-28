@@ -7,6 +7,8 @@ in `c/`).
 
 - `README.md`: what Barb is and the layout.
 - `docs/VERSIONS.md`: why there are two versions and where they differ.
+- `docs/SESSIONS.md`: the saved-conversation format. It is what the two must agree on; change
+  it in both or bump its version.
 - `TODO.md`: what is next, for both, with a model suggestion for each task.
 
 Rules for both:

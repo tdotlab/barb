@@ -56,6 +56,18 @@ impl Ev {
 
 // ---- the command line ----
 
+/// Which conversation a run takes up.
+#[derive(Debug, Default, PartialEq)]
+pub enum Start {
+    /// A new one.
+    #[default]
+    New,
+    /// The one saved last in this directory.
+    Continue,
+    /// A saved one, by name or path.
+    Resume(OsString),
+}
+
 #[derive(Debug, Default, PartialEq)]
 pub struct Args {
     pub prompt: Option<OsString>,
@@ -64,6 +76,11 @@ pub struct Args {
     pub yes: bool,
     pub max_turns: i32,
     pub no_instructions: bool,
+    pub start: Start,
+    pub no_save: bool,
+    /// List the saved conversations and exit.
+    pub sessions: bool,
+    pub verbose: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -91,6 +108,17 @@ pub fn parse(argv: &[OsString]) -> Parsed {
             a.yes = true;
         } else if is("--no-instructions") {
             a.no_instructions = true;
+        } else if is("-c") || is("--continue") {
+            a.start = Start::Continue;
+        } else if (is("-r") || is("--resume")) && val.is_some() {
+            a.start = Start::Resume(val.unwrap());
+            i += 1;
+        } else if is("--no-save") {
+            a.no_save = true;
+        } else if is("--sessions") {
+            a.sessions = true;
+        } else if is("-v") || is("--verbose") {
+            a.verbose = true;
         } else if (is("-p") || is("--prompt")) && val.is_some() {
             a.prompt = val;
             i += 1;
@@ -184,6 +212,139 @@ pub fn ymd(year: i32, mon: i32, mday: i32) -> String {
 /// A time as HH:MM.
 pub fn hhmm(hour: i32, min: i32) -> Vec<u8> {
     format!("{:02}:{:02}", hour, min).into_bytes()
+}
+
+// ---- saved conversations ----
+//
+// Each one is a file in .barb/sessions in the working directory, named for when it started
+// (YYYYMMDD-HHMMSS.json); the format is in docs/SESSIONS.md. .barb/ gets a .gitignore of "*"
+// when the first one is saved, so it stays out of the project's git.
+
+pub const SESSIONS: &str = ".barb/sessions";
+
+/// Where this run saves its conversation (empty: it does not), and the saved one it takes up.
+#[derive(Debug, Default, PartialEq)]
+pub struct Plan {
+    pub path: Vec<u8>,
+    /// The file's contents, when resuming.
+    pub data: Option<Vec<u8>>,
+    /// The model it was saved with.
+    pub model: Vec<u8>,
+}
+
+fn session_files(dir: &std::path::Path) -> Vec<(std::time::SystemTime, String)> {
+    let mut v = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else { return v };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(".json") || name.starts_with('.') {
+            continue;
+        }
+        let Ok(md) = e.metadata() else { continue };
+        if md.is_file() {
+            v.push((md.modified().unwrap_or(std::time::UNIX_EPOCH), name));
+        }
+    }
+    v.sort_by(|a, b| b.cmp(a)); // newest first
+    v
+}
+
+/// The name a new conversation started at this local time gets, if `taken` says it is free:
+/// YYYYMMDD-HHMMSS, then with -b, -c, ... after it.
+pub fn new_name(t: (i32, i32, i32, i32, i32), sec: u32, taken: impl Fn(&str) -> bool) -> String {
+    let base = format!("{:04}{:02}{:02}-{:02}{:02}{:02}", t.0, t.1, t.2, t.3, t.4, sec % 60);
+    if !taken(&base) {
+        return base;
+    }
+    for c in b'b'..=b'z' {
+        let n = format!("{}-{}", base, c as char);
+        if !taken(&n) {
+            return n;
+        }
+    }
+    format!("{}-{}", base, std::process::id())
+}
+
+/// The file `arg` names: a path if it has a slash in it, else a name in .barb/sessions (with or
+/// without .json).
+pub fn session_file(arg: &str) -> String {
+    if arg.contains('/') || (cfg!(windows) && arg.contains('\\')) {
+        return arg.to_string();
+    }
+    let n = if arg.ends_with(".json") { arg.to_string() } else { format!("{}.json", arg) };
+    format!("{}/{}", SESSIONS, n)
+}
+
+/// What this run does about saved conversations, given the local time (for a new one's name).
+pub fn plan(a: &Args, now: (i32, i32, i32, i32, i32), sec: u32) -> Result<Plan, String> {
+    let dir = std::path::Path::new(SESSIONS);
+    let path = match &a.start {
+        Start::New => {
+            if a.no_save {
+                return Ok(Plan::default());
+            }
+            let name = new_name(now, sec, |n| dir.join(format!("{}.json", n)).exists());
+            return Ok(Plan { path: format!("{}/{}.json", SESSIONS, name).into_bytes(), ..Plan::default() });
+        }
+        Start::Continue => match session_files(dir).into_iter().next() {
+            Some((_, name)) => format!("{}/{}", SESSIONS, name),
+            None => return Err("there is no saved conversation in this directory to continue".into()),
+        },
+        Start::Resume(r) => session_file(&r.to_string_lossy()),
+    };
+    let data = std::fs::read(&path).map_err(|e| format!("cannot read {}: {}", path, strerror(&e)))?;
+    let s = barb_core::api::load_session(&data).ok_or_else(|| format!("{} is not a saved Barb conversation", path))?;
+    Ok(Plan { path: if a.no_save { Vec::new() } else { path.into_bytes() }, data: Some(data), model: s.model })
+}
+
+/// After a file was written: if it was a saved conversation, keep .barb/ out of git.
+pub fn wrote(path: &[u8]) {
+    if !path.starts_with(SESSIONS.as_bytes()) {
+        return;
+    }
+    let gi = std::path::Path::new(".barb/.gitignore");
+    if !gi.exists() {
+        let _ = std::fs::write(gi, "# Barb's saved conversations; not part of the project.\n*\n");
+    }
+}
+
+/// What --sessions prints: the newest saved conversations here, each with its size and how it
+/// began.
+pub fn list_sessions() -> String {
+    let files = session_files(std::path::Path::new(SESSIONS));
+    if files.is_empty() {
+        return "No saved conversations in this directory.\n".into();
+    }
+    let mut out = String::new();
+    for (_, name) in files.iter().take(20) {
+        let stem = name.strip_suffix(".json").unwrap_or(name);
+        let s = std::fs::read(format!("{}/{}", SESSIONS, name)).ok().and_then(|d| barb_core::api::load_session(&d));
+        let Some(s) = s else {
+            out.push_str(&format!("{}  (unreadable)\n", stem));
+            continue;
+        };
+        let first = s.tr.msgs.iter().filter(|m| !m.assistant).flat_map(|m| m.blocks.iter()).find_map(|b| match b {
+            barb_core::api::Block::Text(t) if !t.starts_with(b"[barb]") => Some(t.clone()),
+            _ => None,
+        });
+        let first = first.map(|t| barb_core::text::first_line(&t, 60).to_vec()).unwrap_or_default();
+        out.push_str(&format!("{}  {:>4} messages  {}\n", stem, s.tr.msgs.len(), String::from_utf8_lossy(&first)));
+    }
+    if files.len() > 20 {
+        out.push_str(&format!("({} older ones not shown)\n", files.len() - 20));
+    }
+    out
+}
+
+/// The line shown when an interactive run ends with its conversation saved.
+pub fn saved_line(path: &[u8]) -> Option<String> {
+    let p = String::from_utf8_lossy(path).into_owned();
+    if p.is_empty() || !std::path::Path::new(&p).is_file() {
+        return None;
+    }
+    let name = p.rsplit('/').next().unwrap_or(&p);
+    let name = name.strip_suffix(".json").unwrap_or(name);
+    Some(format!("Saved as {}; barb -r {} takes it up again.\n", name, name))
 }
 
 // ---- a command's output ----
@@ -370,6 +531,37 @@ mod tests {
             Parsed::Run(a) => assert_eq!(a.prompt, Some("-h".into()), "a value is taken as it is"),
             p => panic!("{:?}", p),
         }
+    }
+
+    #[test]
+    fn session_options() {
+        let run = |v: &[&str]| match parse(&os(v)) {
+            Parsed::Run(a) => a,
+            p => panic!("{:?}", p),
+        };
+        assert_eq!(run(&[]).start, Start::New);
+        assert_eq!(run(&["-c"]).start, Start::Continue);
+        assert_eq!(run(&["--continue"]).start, Start::Continue);
+        assert_eq!(run(&["-r", "x"]).start, Start::Resume("x".into()));
+        assert_eq!(run(&["--resume", "a/b.json"]).start, Start::Resume("a/b.json".into()));
+        assert_eq!(parse(&os(&["-r"])), Parsed::Bad("-r".into()), "a name is needed");
+        let a = run(&["--no-save", "--sessions", "-v"]);
+        assert!(a.no_save && a.sessions && a.verbose);
+        assert!(run(&["--verbose"]).verbose);
+        let a = run(&[]);
+        assert!(!a.no_save && !a.sessions && !a.verbose);
+    }
+
+    #[test]
+    fn session_names() {
+        let t = (2026, 11, 27, 9, 5);
+        assert_eq!(new_name(t, 7, |_| false), "20261127-090507");
+        assert_eq!(new_name(t, 67, |_| false), "20261127-090507", "seconds wrap");
+        assert_eq!(new_name(t, 7, |n| n == "20261127-090507"), "20261127-090507-b");
+        assert_eq!(new_name(t, 7, |n| n == "20261127-090507" || n.ends_with("-b")), "20261127-090507-c");
+        assert_eq!(session_file("20261127-090507"), ".barb/sessions/20261127-090507.json");
+        assert_eq!(session_file("x.json"), ".barb/sessions/x.json");
+        assert_eq!(session_file("d/x.json"), "d/x.json", "a path is taken as it is");
     }
 
     #[test]

@@ -550,10 +550,42 @@ impl Screen {
         }
     }
 
+    // What the user said, shown again (a resumed conversation): as it looked when they typed it.
+    fn user(&mut self, p: &[u8]) {
+        self.gap(2, Gap::User);
+        let st = self.styled(2);
+        for (k, line) in p.split(|&c| c == b'\n').enumerate() {
+            self.wr(2, match (k, st) {
+                (0, true) => b"\x1b[1;35m> \x1b[0m",
+                (0, false) => b"> ",
+                _ => b"  ",
+            });
+            self.safe(2, line);
+            self.wr(2, b"\n");
+        }
+    }
+
+    // The model's thinking: dim and italic, every line, so it reads as an aside. It is spaced
+    // like a reply.
+    fn thinking(&mut self, p: &[u8]) {
+        self.gap(2, Gap::Assist);
+        let st = self.styled(2);
+        for line in p.split(|&c| c == b'\n') {
+            if st {
+                self.wr(2, b"\x1b[2;3m");
+            }
+            self.safe(2, line);
+            self.wr(2, if st { b"\x1b[0m\n" } else { b"\n" });
+        }
+    }
+
     pub fn say(&mut self, style: Style, p: &[u8]) {
         self.clear();
-        if style == Style::Assistant {
-            return self.assistant(p);
+        match style {
+            Style::Assistant => return self.assistant(p),
+            Style::User => return self.user(p),
+            Style::Thinking => return self.thinking(p),
+            _ => {}
         }
         let follow = !p.is_empty() && p[0] == b' ';
         if !self.styled(2) {

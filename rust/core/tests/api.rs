@@ -178,3 +178,154 @@ fn reply() {
         assert_eq!(api::parse(j.as_bytes()), None, "should be refused: {j}");
     }
 }
+
+// ---- saved sessions ----
+
+fn sample() -> Transcript {
+    let mut t = Transcript::default();
+    t.user_msg().add_text(b"hello \"there\"");
+    let mut m = Msg { assistant: true, blocks: vec![] };
+    m.blocks.push(Block::Raw(b"{\"type\":\"thinking\",\"thinking\":\"hmm\",\"signature\":\"abc\"}".to_vec()));
+    m.add_text(b"looking");
+    m.blocks.push(Block::ToolUse { id: b"t1".to_vec(), name: b"bash".to_vec(), input: b"{\"command\":\"ls\"}".to_vec() });
+    m.blocks.push(Block::ToolUse { id: b"t2".to_vec(), name: b"read_file".to_vec(), input: b"{}".to_vec() });
+    t.msgs.push(m);
+    let u = t.user_msg();
+    u.blocks.push(Block::ToolResult { id: b"t1".to_vec(), content: b"a\nb".to_vec(), is_error: false });
+    u.blocks.push(Block::ToolResult { id: b"t2".to_vec(), content: b"no".to_vec(), is_error: true });
+    u.add_text(b"[barb] a note");
+    t
+}
+
+#[test]
+fn session_round_trip() {
+    let t = sample();
+    let f = api::session(b"m1", b"C:\\w", &t);
+    assert!(json::valid(&f));
+    assert!(s(&f).starts_with("{\"barb_session\":1,\"model\":\"m1\",\"cwd\":\"C:\\\\w\",\"messages\":[{\"role\":\"user\""), "{}", s(&f));
+    assert!(!s(&f).contains("cache_control"));
+    let got = api::load_session(&f).expect("loads");
+    assert_eq!(got.model, b"m1");
+    assert_eq!(got.cwd, b"C:\\w");
+    assert_eq!(got.tr.msgs.len(), 3);
+    // the same conversation: the same request, the same file
+    let cfg = Cfg { model: b"m", max_tokens: 1, system: b"", tools: b"" };
+    assert_eq!(s(&api::request(&cfg, &got.tr)), s(&api::request(&cfg, &t)));
+    assert_eq!(s(&api::session(b"m1", b"C:\\w", &got.tr)), s(&f));
+    match &got.tr.msgs[2].blocks[1] {
+        Block::ToolResult { id, content, is_error } => {
+            assert_eq!((&id[..], &content[..], *is_error), (&b"t2"[..], &b"no"[..], true));
+        }
+        b => panic!("{:?}", b),
+    }
+    assert!(matches!(&got.tr.msgs[1].blocks[0], Block::Raw(_)), "thinking stays as it came");
+}
+
+#[test]
+fn session_load_repairs() {
+    // Saved with a tool call whose result never came (Barb was closed while it ran).
+    let f = concat!(
+        r#"{"barb_session":1,"messages":[{"role":"user","content":[{"type":"text","text":"go"}]},"#,
+        r#"{"role":"assistant","content":[{"type":"tool_use","id":"a","name":"bash","input":{}}]}]}"#
+    );
+    let got = api::load_session(f.as_bytes()).expect("loads");
+    assert_eq!(got.tr.msgs.len(), 3);
+    assert!(matches!(&got.tr.msgs[2].blocks[0], Block::ToolResult { is_error: true, .. }));
+}
+
+#[test]
+fn session_refuses_what_is_not_one() {
+    let ok = "{\"barb_session\":1,\"messages\":[]}";
+    assert!(api::load_session(ok.as_bytes()).is_some(), "model and cwd may be missing");
+    for bad in [
+        "",
+        "not json",
+        "{\"messages\":[]}",
+        "{\"barb_session\":2,\"messages\":[]}",
+        "{\"barb_session\":0,\"messages\":[]}",
+        "{\"barb_session\":\"1\",\"messages\":[]}",
+        "{\"barb_session\":1}",
+        "{\"barb_session\":1,\"messages\":{}}",
+        "{\"barb_session\":1,\"messages\":[1]}",
+        "{\"barb_session\":1,\"messages\":[{\"role\":\"system\",\"content\":[]}]}",
+        "{\"barb_session\":1,\"messages\":[{\"role\":\"user\"}]}",
+        "{\"barb_session\":1,\"messages\":[{\"content\":[]}]}",
+        "{\"barb_session\":1,\"messages\":[{\"role\":\"user\",\"content\":[]}]",
+    ] {
+        assert!(api::load_session(bad.as_bytes()).is_none(), "{bad}");
+    }
+    // a tool_result whose content is not a string is kept as it is
+    let f = "{\"barb_session\":1,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"x\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}]}]}";
+    let t = api::load_session(f.as_bytes()).unwrap().tr;
+    assert!(matches!(&t.msgs[0].blocks[0], Block::Raw(_)));
+}
+
+fn tu(id: &str) -> Block {
+    Block::ToolUse { id: id.as_bytes().to_vec(), name: b"bash".to_vec(), input: b"{}".to_vec() }
+}
+fn tr(id: &str) -> Block {
+    Block::ToolResult { id: id.as_bytes().to_vec(), content: b"r".to_vec(), is_error: false }
+}
+fn text(t: &str) -> Block {
+    Block::Text(t.as_bytes().to_vec())
+}
+fn msg(assistant: bool, blocks: Vec<Block>) -> Msg {
+    Msg { assistant, blocks }
+}
+
+/// Each message as a line: "u: text(hi) result(a!)" (! for an error).
+fn shape(t: &Transcript) -> Vec<String> {
+    t.msgs
+        .iter()
+        .map(|m| {
+            let mut l = String::from(if m.assistant { "a:" } else { "u:" });
+            for b in &m.blocks {
+                l += &match b {
+                    Block::Text(x) => format!(" text({})", s(x)),
+                    Block::ToolUse { id, .. } => format!(" use({})", s(id)),
+                    Block::ToolResult { id, is_error, .. } => format!(" result({}{})", s(id), if *is_error { "!" } else { "" }),
+                    Block::Raw(_) => " raw".into(),
+                };
+            }
+            l
+        })
+        .collect()
+}
+
+#[test]
+fn repair() {
+    // A reply with calls and nothing after it: a user message with their results.
+    let mut t = Transcript { msgs: vec![msg(false, vec![text("go")]), msg(true, vec![text("ok"), tu("a"), tu("b")])] };
+    assert_eq!(t.repair(), 2);
+    assert_eq!(shape(&t), ["u: text(go)", "a: text(ok) use(a) use(b)", "u: result(a!) result(b!)"]);
+    assert_eq!(t.repair(), 0, "repairing twice changes nothing");
+    match &t.msgs[2].blocks[0] {
+        Block::ToolResult { content, .. } => assert!(s(content).contains("Barb was closed")),
+        b => panic!("{:?}", b),
+    }
+
+    // Some results there, some not, and text after them: the missing ones go first.
+    let mut t = Transcript {
+        msgs: vec![msg(false, vec![text("go")]), msg(true, vec![tu("a"), tu("b")]), msg(false, vec![tr("b"), text("more")])],
+    };
+    assert_eq!(t.repair(), 1);
+    assert_eq!(shape(&t), ["u: text(go)", "a: use(a) use(b)", "u: result(a!) result(b) text(more)"]);
+
+    // Empty messages go, and what was on either side of one is joined.
+    let mut t = Transcript {
+        msgs: vec![
+            msg(false, vec![text("a")]),
+            msg(true, vec![text("")]),
+            msg(false, vec![text("b")]),
+            msg(true, vec![]),
+            msg(true, vec![text("c")]),
+        ],
+    };
+    assert_eq!(t.repair(), 0);
+    assert_eq!(shape(&t), ["u: text(a) text(b)", "a: text(c)"]);
+
+    // Calls in a message that ended up joined to the next one are still answered.
+    let mut t = Transcript { msgs: vec![msg(true, vec![tu("x")]), msg(false, vec![]), msg(true, vec![tu("y")])] };
+    assert_eq!(t.repair(), 2);
+    assert_eq!(shape(&t), ["a: use(x) use(y)", "u: result(x!) result(y!)"]);
+}

@@ -507,7 +507,10 @@ impl App {
             Action::Say { .. } => {}
             Action::Http { id, path, body } => self.ops.http(&mut self.q, *id, path.as_bytes(), body),
             Action::Read { id, path } => self.ops.read(&mut self.q, *id, path),
-            Action::Write { id, path, data } => self.ops.write(&mut self.q, *id, path, data),
+            Action::Write { id, path, data } => {
+                self.ops.write(&mut self.q, *id, path, data);
+                common::wrote(path);
+            }
             Action::Spawn { id, cmd, timeout_ms, background, log } => {
                 self.ops.spawn(&mut self.q, *id, cmd, *timeout_ms, *background, log)
             }
@@ -627,6 +630,11 @@ fn usage(h: HANDLE, con: bool) {
          \x20 -C, --cwd DIR       work in DIR\n\
          \x20     --max-turns N   stop after N model calls without you typing (default 60)\n\
          \x20     --no-instructions  do not read AGENTS.md or CLAUDE.md from the working directory\n\
+         \x20 -c, --continue      take up the conversation saved last in this directory\n\
+         \x20 -r, --resume NAME   take up a saved conversation (--sessions lists them)\n\
+         \x20     --sessions      list the conversations saved in this directory\n\
+         \x20     --no-save       do not save this conversation (they go in .barb/sessions)\n\
+         \x20 -v, --verbose       show the model's thinking (/verbose switches it)\n\
          \x20 -V, --version\n\
          \x20 -h, --help\n\n\
          environment: ANTHROPIC_API_KEY (required), ANTHROPIC_BASE_URL, BARB_MODEL,\n\
@@ -708,8 +716,34 @@ pub fn main() -> i32 {
         Parsed::Run(a) => a,
     };
     let mut model = args.model.as_deref().or(std::env::var_os("BARB_MODEL").as_deref()).map(bytes).unwrap_or_default();
+    let chosen = !model.is_empty();
     if model.is_empty() {
         model = DEFAULT_MODEL.as_bytes().to_vec();
+    }
+
+    if let Some(d) = &args.cwd {
+        if std::env::set_current_dir(d).is_err() {
+            let mut m = b"barb: cannot change to ".to_vec();
+            m.extend(bytes(d));
+            m.push(b'\n');
+            err(&m);
+            return 2;
+        }
+    }
+    if args.sessions {
+        write_handle(h_out, con_out, common::list_sessions().as_bytes());
+        return 0;
+    }
+    let sec = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() % 60) as u32;
+    let plan = match common::plan(&args, local_time(0).unwrap_or((1970, 1, 1, 0, 0)), sec) {
+        Ok(p) => p,
+        Err(e) => {
+            err(format!("barb: {}\n", e).as_bytes());
+            return 2;
+        }
+    };
+    if !chosen && !plan.model.is_empty() {
+        model = plan.model.clone(); // go on with the model it was saved with
     }
 
     // Take the key out of the environment: every command the model runs inherits it otherwise,
@@ -725,15 +759,6 @@ pub fn main() -> i32 {
         err(common::PLAIN_HTTP_WARNING.as_bytes());
     }
 
-    if let Some(d) = &args.cwd {
-        if std::env::set_current_dir(d).is_err() {
-            let mut m = b"barb: cannot change to ".to_vec();
-            m.extend(bytes(d));
-            m.push(b'\n');
-            err(&m);
-            return 2;
-        }
-    }
     let cwd = std::env::current_dir().map(|p| bytes(p.as_os_str())).unwrap_or_else(|_| b".".to_vec());
     let date = local_time(0).map(|(y, m, d, _, _)| common::ymd(y, m, d)).unwrap_or_default();
 
@@ -800,6 +825,8 @@ pub fn main() -> i32 {
             auto_approve: args.yes,
             max_turns: args.max_turns.max(0) as u32,
             instructions: !args.no_instructions,
+            session: plan.path.clone(),
+            verbose: args.verbose,
         }),
         scr: Screen::new(ScreenConfig {
             mode: if interactive {
@@ -876,8 +903,19 @@ pub fn main() -> i32 {
             app.push(Ev::Eof);
         }
     }
+    if let Some(d) = &plan.data {
+        // Queued events wait until the loop starts, so this comes first.
+        for a in app.agent.resume(d, interactive).unwrap_or_default() {
+            app.exec(&a);
+        }
+    }
     app.run();
     app.cleanup();
+    if interactive {
+        if let Some(l) = common::saved_line(&app.agent.session_path()) {
+            err(l.as_bytes());
+        }
+    }
     // The reader thread may still be blocked on standard input; ending the process ends it.
     app.exit_code
 }

@@ -20,6 +20,7 @@ CARGO = os.environ.get("CARGO") or shutil.which("cargo") or "cargo"
 
 # What to run: cargo test arguments.
 AGENT = ["-p", "barb-core", "--test", "agent"]
+API = ["-p", "barb-core", "--test", "api"]
 EDIT = ["-p", "barb-ui", "--test", "edit"]
 KEYS = ["-p", "barb-ui", "--test", "keys"]
 MD = ["-p", "barb-ui", "--test", "md"]
@@ -48,6 +49,43 @@ MUTATIONS = [
     ('load-every-turn', 'core/src/agent.rs', 'if self.cfg.instructions && self.ld.phase == LdPhase::None {', 'if self.cfg.instructions && self.ld.phase != LdPhase::Imports {', AGENT),
     ('timeout-fraction-dropped', 'core/src/tools.rs', '            if n % 1000 != 0 {\n                push!(r; ".", n % 1000 / 100);\n            }\n', '', AGENT),
     ('timeout-always-plural', 'core/src/tools.rs', 'if n == 1000 { " second" } else { " seconds" }', '" seconds"', AGENT),
+
+    # Saved conversations and verbose, in the agent and the API layer.
+    ('save-never', 'core/src/agent.rs', 'if self.cfg.session.is_empty() {\n            return;\n        }\n        let data', 'if true {\n            return;\n        }\n        let data', AGENT),
+    ('save-not-after-send', 'core/src/agent.rs', '        self.wait_said = false;\n        self.save();\n', '        self.wait_said = false;\n', AGENT),
+    ('save-not-after-reply', 'core/src/agent.rs', '            self.tr.msgs.push(r.msg);\n            self.save();', '            self.tr.msgs.push(r.msg);', AGENT),
+    ('save-not-after-interrupt', 'core/src/agent.rs', '                self.tr.user_msg().add_text(b"[barb] The user interrupted you here, before you replied.");\n                self.save();\n', '                self.tr.user_msg().add_text(b"[barb] The user interrupted you here, before you replied.");\n', AGENT),
+    ('save-not-after-tool-interrupt', 'core/src/agent.rs', '                self.complete_round(false);\n                self.save();\n', '                self.complete_round(false);\n', AGENT),
+    ('save-result-not-routed', 'core/src/agent.rs', ' if self.save_ops.contains(&id) => self.on_saved(id, status, note),', ' if false => self.on_saved(id, status, note),', AGENT),
+    ('save-failure-silent', 'core/src/agent.rs', 'if status == Fs::Ok || self.save_warned {', 'if true {', AGENT),
+    ('save-failure-every-time', 'core/src/agent.rs', '        self.save_warned = true;\n        let mut b', '        let mut b', AGENT),
+    ('save-clear-same-file', 'core/src/agent.rs', '                    self.clears += 1; // the old conversation stays in its file\n', '', AGENT),
+    ('save-clear-path-off-by-one', 'core/src/agent.rs', 'cat!(stem, "-", self.clears + 1, ".json")', 'cat!(stem, "-", self.clears, ".json")', AGENT),
+    ('save-clear-empty-bumps', 'core/src/agent.rs', 'if !self.tr.msgs.is_empty() && !self.cfg.session.is_empty() {\n                    self.clears', 'if !self.cfg.session.is_empty() {\n                    self.clears', AGENT),
+    ('resume-no-note', 'core/src/agent.rs', '        self.resume_note = note;\n', '        let _ = note;\n', AGENT),
+    ('resume-note-dropped', 'core/src/agent.rs', '        let resumed = core::mem::take(&mut self.resume_note);\n        let u = self.tr.user_msg();\n        u.add_text(&resumed);', '        let u = self.tr.user_msg();', AGENT),
+    ('resume-note-survives-clear', 'core/src/agent.rs', '                self.resume_note.clear();\n', '', AGENT),
+    ('resume-cwd-unchecked', 'core/src/agent.rs', 'if !s.cwd.is_empty() && s.cwd != self.cfg.cwd {', 'if false {', AGENT),
+    ('resume-no-replay', 'core/src/agent.rs', '        if show {\n            self.replay();\n        }\n', '', AGENT),
+    ('resume-replay-all', 'core/src/agent.rs', 'let from = n.saturating_sub(REPLAY_MSGS);', 'let from = 0 * n;', AGENT),
+    ('resume-replay-shows-notes', 'core/src/agent.rs', '                        if !t.starts_with(b"[barb]") {\n                            self.say(Style::User, t.clone());\n                        }', '                        self.say(Style::User, t.clone());', AGENT),
+    ('resume-replay-no-tools', 'core/src/agent.rs', '                        let t = tools::label(name, input);\n                        self.say(Style::Tool, t);', '                        let _ = (name, input);', AGENT),
+    ('thinking-always', 'core/src/agent.rs', '        if !self.cfg.verbose {\n            return;\n        }\n        let Some(kind)', '        let Some(kind)', AGENT),
+    ('thinking-redacted-unshown', 'core/src/agent.rs', '            self.say(Style::Thinking, "[redacted thinking]");', '', AGENT),
+    ('thinking-untrimmed', 'core/src/agent.rs', '                let t = text::trim(&t);\n', '                let t = &t[..];\n', AGENT),
+    ('verbose-command-dead', 'core/src/agent.rs', '                self.cfg.verbose = !self.cfg.verbose;\n', '', AGENT),
+    ('label-no-path', 'core/src/tools.rs', 'b"read_file" | b"edit_file" | b"write_file" => push!(b; " ", s("path")),', 'b"read_file" | b"edit_file" | b"write_file" => {}', AGENT),
+    ('label-no-description', 'core/src/tools.rs', 'push!(b; if desc.is_empty() { text::first_line(&cmd, 100) } else { &desc[..] });', 'push!(b; text::first_line(&cmd, 100));', AGENT),
+    ('label-no-background', 'core/src/tools.rs', 'push!(b; " ", if bg { "(background) " } else { "" });', 'push!(b; " ");', AGENT),
+    ('session-any-version', 'core/src/api.rs', 'if !(1..=SESSION_VERSION).contains(&v) {', 'if v < 1 {', API),
+    ('session-any-role', 'core/src/api.rs', 'if !m.assistant && role != b"user" {', 'if false {', API),
+    ('session-no-repair', 'core/src/api.rs', '    s.tr.repair();\n    Some(s)', '    Some(s)', API),
+    ('session-no-cwd', 'core/src/api.rs', '    w.key("cwd");\n    w.str(cwd);\n', '', API),
+    ('repair-keeps-empty', 'core/src/api.rs', '        self.msgs.retain(|m| m.blocks.iter().any(Block::emittable));\n', '', API),
+    ('repair-no-merge', 'core/src/api.rs', 'if self.msgs[i].assistant == self.msgs[i - 1].assistant {', 'if false {', API),
+    ('repair-no-new-user-msg', 'core/src/api.rs', "            if !matches!(self.msgs.get(i + 1), Some(m) if !m.assistant) {\n                self.msgs.insert(i + 1, Msg { assistant: false, blocks: Vec::new() });\n            }\n", "            if self.msgs.len() == i + 1 {\n                break;\n            }\n", API),
+    ('repair-duplicates-results', 'core/src/api.rs', "let has = next.blocks.iter().any(|b| matches!(b, Block::ToolResult { id: r, .. } if *r == id));", "let has = false;", API),
+    ('repair-results-at-end', 'core/src/api.rs', '                    next.blocks.insert(\n                        k,', '                    next.blocks.insert(\n                        next.blocks.len(),', API),
 
     # The prompt's line editor. Its test plays the output on a terminal emulator.
     ("edit-settle-no-cr", "ui/src/edit.rs", 'extend_from_slice(b" \\r");', 'extend_from_slice(b" ");', EDIT),
@@ -214,6 +252,19 @@ MUTATIONS = [
 
     # What both platforms' programs share: the command line, kept output, talking to curl.
     ('common-max-turns-unparsed', 'barb/src/common.rs', 'a.max_turns = atoi(', 'a.max_turns = 1 + 0 * atoi(', COMMON),
+    ('common-continue-unparsed', 'barb/src/common.rs', '            a.start = Start::Continue;\n', '', COMMON),
+    ('common-name-no-suffix', 'barb/src/common.rs', '    if !taken(&base) {\n        return base;\n    }\n', '    if true {\n        return base;\n    }\n', COMMON),
+    ('common-name-seconds-unwrapped', 'barb/src/common.rs', 't.3, t.4, sec % 60);', 't.3, t.4, sec);', COMMON),
+    ('common-session-file-path-as-name', 'barb/src/common.rs', "    if arg.contains('/') || (cfg!(windows) && arg.contains('\\\\')) {\n        return arg.to_string();\n    }\n", '', COMMON),
+    ('common-session-file-double-json', 'barb/src/common.rs', 'let n = if arg.ends_with(".json") { arg.to_string() } else { format!("{}.json", arg) };', 'let n = format!("{}.json", arg);', COMMON),
+    ('e2e-no-save-saves', 'barb/src/common.rs', '            if a.no_save {\n                return Ok(Plan::default());\n            }\n', '', E2E),
+    ('e2e-resume-no-save-saves', 'barb/src/common.rs', 'path: if a.no_save { Vec::new() } else { path.into_bytes() },', 'path: path.into_bytes(),', E2E),
+    ('e2e-continue-oldest', 'barb/src/common.rs', '    v.sort_by(|a, b| b.cmp(a)); // newest first\n', '    v.sort(); // newest first\n', E2E),
+    ('e2e-resume-garbage', 'barb/src/common.rs', '    let s = barb_core::api::load_session(&data).ok_or_else(|| format!("{} is not a saved Barb conversation", path))?;\n    Ok(Plan { path: if a.no_save { Vec::new() } else { path.into_bytes() }, data: Some(data), model: s.model })',
+     '    let s = barb_core::api::load_session(&data).unwrap_or(barb_core::api::Session { model: Vec::new(), cwd: Vec::new(), tr: Default::default() });\n    Ok(Plan { path: if a.no_save { Vec::new() } else { path.into_bytes() }, data: Some(data), model: s.model })', E2E),
+    ('e2e-no-gitignore', 'barb/src/common.rs', '    if !gi.exists() {\n', '    if false {\n', E2E),
+    ('e2e-no-saved-line', 'barb/src/common.rs', 'Some(format!("Saved as {}; barb -r {} takes it up again.\\n", name, name))', 'Some(String::from(&name[..0]))', E2E),
+    ('e2e-sessions-no-first-line', 'barb/src/common.rs', 'String::from_utf8_lossy(&first)));', 'String::from_utf8_lossy(&first[..0])));', E2E),
     ('common-output-head-overfills', 'barb/src/common.rs', 'let take = (self.head_keep - self.head.len()).min(p.len());', 'let take = p.len();', COMMON),
     ('common-output-drop-unmarked', 'barb/src/common.rs', '            out.extend_from_slice(format!("\\n[... {} bytes of output dropped here ...]\\n", dropped).as_bytes());\n', '', COMMON),
     ('common-curl-000-kept', 'barb/src/common.rs', '        if s.ends_with(b"000") {\n            s = &s[..s.len() - 3];\n        }\n', '', COMMON),
@@ -252,6 +303,8 @@ MUTATIONS = [
     ('posix-suspend-terminal-raw', 'barb/src/posix/mod.rs', '        self.term_restore();\n        sys::on_signal(sys::SIGTSTP', '        sys::on_signal(sys::SIGTSTP', E2E),
     ('posix-suspend-default', 'barb/src/posix/mod.rs', '        catch(sys::SIGTSTP);\n        catch(sys::SIGCONT);', '        catch(sys::SIGCONT);', E2E),
     ('posix-ctrl-backslash-quits', 'barb/src/posix/mod.rs', '    t.cc[sys::VQUIT] = sys::VDISABLE;\n', '', E2E),
+    ('posix-resume-not-taken-up', 'barb/src/posix/mod.rs', 'if let Some(d) = &plan.data {', 'if let Some(d) = plan.data.as_ref().filter(|_| false) {', E2E),
+    ('posix-saved-model-ignored', 'barb/src/posix/mod.rs', 'if !chosen && !plan.model.is_empty() {', 'if false {', E2E),
     ('posix-question-unasked-allowed', 'barb/src/posix/mod.rs', '            self.scr.say(Style::Error, NOT_ALLOWED);\n            self.answer(id, Answer::No);', '            self.answer(id, Answer::Yes);', E2E),
     # The Windows program: its operations through their own tests, the front end through the
     # end-to-end test.
@@ -275,6 +328,8 @@ MUTATIONS = [
     ('win-paste-never-ends', 'barb/src/win32/mod.rs', 'let mut p = std::mem::take(&mut self.paste);', 'let mut p = self.paste.clone();', E2E),
     ('win-ctrl-c-never-clears', 'barb/src/win32/mod.rs', 'if !self.agent.busy() && !self.scr.ed.line.is_empty() {', 'if false {', E2E),
     ('win-crlf-two-enters', 'barb/src/win32/mod.rs', 'if ch == 10 && *last == 13 {', 'if false {', WMAIN),
+    ('win-resume-not-taken-up', 'barb/src/win32/mod.rs', 'if let Some(d) = &plan.data {', 'if let Some(d) = plan.data.as_ref().filter(|_| false) {', E2E),
+    ('win-saved-model-ignored', 'barb/src/win32/mod.rs', 'if !chosen && !plan.model.is_empty() {', 'if false {', E2E),
     ('win-question-unasked-allowed', 'barb/src/win32/mod.rs', '            self.push(Ev::Answer { id, answer: Answer::No });\n            return;', '            self.push(Ev::Answer { id, answer: Answer::Yes });\n            return;', E2E),
 ]
 

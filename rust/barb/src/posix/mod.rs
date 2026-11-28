@@ -229,7 +229,10 @@ impl App {
             Action::Say { .. } => self.need_prompt = true,
             Action::Http { id, path, body } => self.ops.http(&mut self.q, *id, path.as_bytes(), body),
             Action::Read { id, path } => self.ops.read(&mut self.q, *id, path),
-            Action::Write { id, path, data } => self.ops.write(&mut self.q, *id, path, data),
+            Action::Write { id, path, data } => {
+                self.ops.write(&mut self.q, *id, path, data);
+                common::wrote(path);
+            }
             Action::Spawn { id, cmd, timeout_ms, background, log } => {
                 self.ops.spawn(&mut self.q, *id, cmd, *timeout_ms, *background, log)
             }
@@ -635,6 +638,11 @@ fn usage(to_err: bool) {
          \x20 -C, --cwd DIR       work in DIR\n\
          \x20     --max-turns N   stop after N model calls without you typing (default 60)\n\
          \x20     --no-instructions  do not read AGENTS.md or CLAUDE.md from the working directory\n\
+         \x20 -c, --continue      take up the conversation saved last in this directory\n\
+         \x20 -r, --resume NAME   take up a saved conversation (--sessions lists them)\n\
+         \x20     --sessions      list the conversations saved in this directory\n\
+         \x20     --no-save       do not save this conversation (they go in .barb/sessions)\n\
+         \x20 -v, --verbose       show the model's thinking (/verbose switches it)\n\
          \x20 -V, --version\n\
          \x20 -h, --help\n\n\
          environment: ANTHROPIC_API_KEY (required), ANTHROPIC_BASE_URL, BARB_MODEL\n",
@@ -668,9 +676,35 @@ pub fn main() -> i32 {
         }
         Parsed::Run(a) => a,
     };
-    let mut model = args.model.or_else(|| std::env::var_os("BARB_MODEL")).map(bytes).unwrap_or_default();
+    let mut model = args.model.clone().or_else(|| std::env::var_os("BARB_MODEL")).map(bytes).unwrap_or_default();
+    let chosen = !model.is_empty();
     if model.is_empty() {
         model = DEFAULT_MODEL.as_bytes().to_vec();
+    }
+
+    if let Some(d) = &args.cwd {
+        if let Err(e) = std::env::set_current_dir(d) {
+            let mut m = b"barb: cannot change to ".to_vec();
+            m.extend_from_slice(d.as_bytes());
+            m.extend_from_slice(format!(": {}\n", common::strerror(&e)).as_bytes());
+            write_all(2, &m);
+            return 2;
+        }
+    }
+    if args.sessions {
+        write_all(1, common::list_sessions().as_bytes());
+        return 0;
+    }
+    let now_s = now_ms() / 1000;
+    let plan = match common::plan(&args, sys::local(now_s).unwrap_or((1970, 1, 1, 0, 0)), now_s.rem_euclid(60) as u32) {
+        Ok(p) => p,
+        Err(e) => {
+            write_all(2, format!("barb: {}\n", e).as_bytes());
+            return 2;
+        }
+    };
+    if !chosen && !plan.model.is_empty() {
+        model = plan.model.clone(); // go on with the model it was saved with
     }
 
     // Take the key out of the environment: every command the model runs inherits it otherwise,
@@ -686,17 +720,7 @@ pub fn main() -> i32 {
         write_all(2, common::PLAIN_HTTP_WARNING.as_bytes());
     }
 
-    if let Some(d) = &args.cwd {
-        if let Err(e) = std::env::set_current_dir(d) {
-            let mut m = b"barb: cannot change to ".to_vec();
-            m.extend_from_slice(d.as_bytes());
-            m.extend_from_slice(format!(": {}\n", common::strerror(&e)).as_bytes());
-            write_all(2, &m);
-            return 2;
-        }
-    }
     let cwd = std::env::current_dir().map(|p| bytes(p.into_os_string())).unwrap_or_else(|_| b".".to_vec());
-    let now_s = now_ms() / 1000;
     let date = sys::local(now_s).map(|(y, m, d, _, _)| common::ymd(y, m, d)).unwrap_or_default();
     let platform = sys::platform();
 
@@ -769,6 +793,8 @@ pub fn main() -> i32 {
             auto_approve: args.yes,
             max_turns: args.max_turns.max(0) as u32,
             instructions: !args.no_instructions,
+            session: plan.path.clone(),
+            verbose: args.verbose,
         }),
         scr: Screen::new(ScreenConfig {
             mode,
@@ -830,11 +856,22 @@ pub fn main() -> i32 {
             app.push(Ev::Eof);
         }
     }
+    if let Some(d) = &plan.data {
+        // Queued events wait until the loop starts, so this comes first.
+        for a in app.agent.resume(d, app.interactive).unwrap_or_default() {
+            app.exec(&a);
+        }
+    }
     app.run();
     app.keys_off();
     app.scr.hide();
     app.flush();
     app.term_restore();
     app.ops.shutdown();
+    if app.interactive {
+        if let Some(l) = common::saved_line(&app.agent.session_path()) {
+            write_all(2, l.as_bytes());
+        }
+    }
     app.exit_code
 }

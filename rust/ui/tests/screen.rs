@@ -813,3 +813,31 @@ fn random() {
         assert!(escapes_ok(&x.out) || (mode == Mode::Pipe && !x.sc.vt_err));
     }
 }
+
+// ---- a resumed conversation, and thinking ----
+
+#[test]
+fn user_and_thinking() {
+    // Pipe: plain, the user's lines under a "> ".
+    let mut x = setup(Mode::Pipe, false, 80);
+    x.say(Style::User, b"fix\nit");
+    x.say(Style::Thinking, b"hm\nhmm");
+    x.say(Style::Assistant, b"done");
+    assert_eq!(String::from_utf8_lossy(&x.fd2), "> fix\n  it\nhm\nhmm\n");
+    assert_eq!(x.fd1, b"done\n");
+
+    // A terminal: the prompt's colour, thinking dim and italic, a blank line between kinds.
+    let mut x = setup(Mode::Lite, true, 80);
+    x.say(Style::User, b"fix\nit");
+    x.say(Style::Thinking, b"hm\nhmm");
+    x.say(Style::Assistant, b"done");
+    x.say(Style::User, b"next");
+    x.say(Style::User, b"and \x1b[31mred");
+    let e = String::from_utf8_lossy(&x.fd2).into_owned();
+    assert_eq!(
+        e,
+        "\x1b[1;35m> \x1b[0mfix\n  it\n\n\x1b[2;3mhm\x1b[0m\n\x1b[2;3mhmm\x1b[0m\n\n\x1b[1;35m> \x1b[0mnext\n\x1b[1;35m> \x1b[0mand ^[[31mred\n",
+        "no blank line between two of the user's; their escapes are made harmless"
+    );
+    assert!(escapes_ok(&x.out));
+}

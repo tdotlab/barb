@@ -11,11 +11,13 @@ are for Claude and Codex: [Claude: Haiku, Sonnet, Opus] [Codex: Luna, Sol].
 interactive, with a background task and a Ctrl-C, as the C version had. The tests cover the same
 ground, but a live run is what found the C version's last bugs. Sonnet medium, Codex Luna medium.
 
-**Saved sessions.** Write the conversation to disk as it goes and resume it (`--continue`,
-`--resume`), in both versions and in one format, so closing the window loses nothing. Sonnet high.
+**Saved sessions, in C.** Rust has them (`-c`, `-r`, `--sessions`, `--no-save`); C should write
+and read the same files, as `docs/SESSIONS.md` describes, including the repair of a cut-off file and
+the resume note. The Rust tests (`core/tests/agent.rs`, the `test_sessions` part of
+`rust/tests/e2e.py`) are the checklist. Sonnet high, Codex Luna high.
 
-**Verbose: show the thinking.** An option and a command that print the model's thinking blocks
-(DeepSeek's reasoning, for one) as they come back, in both versions. Sonnet medium.
+**Verbose, in C.** Rust has `-v` and `/verbose`: thinking blocks shown dim and italic, hidden by
+default, and shown again on resume. Sonnet medium.
 
 **The port's fixes, in C.** The Rust port found three things the C version still has: the
 plain-http warning matches `http://localhost.evil.com` as local (parse the host), the atomic-write

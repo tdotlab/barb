@@ -36,8 +36,15 @@ with `-m deepseek-flash` (checked live: tools, caching, thinking blocks and back
 OpenRouter works too: `ANTHROPIC_BASE_URL=https://openrouter.ai/api` with an OpenRouter key and a model
 like `-m deepseek/deepseek-chat` (it accepts the `x-api-key` header Barb sends; checked live).
 
-In a session, `/clear` forgets the conversation, `/exit` or Ctrl-D quits, and Ctrl-C stops what
-is running (twice at the prompt quits); the model is told it was interrupted. Type while it works
+The conversation is saved as it goes, in `.barb/sessions/` in the working directory, so closing
+the window loses nothing: `barb -c` takes up the last one, `barb -r NAME` a given one, and
+`barb --sessions` lists them (`--no-save` saves nothing). An interactive run ends by saying the
+name. The format, shared with the C version, is in `../docs/SESSIONS.md`. `-v`/`--verbose` shows
+the model's thinking (DeepSeek's reasoning, Claude's thinking blocks) dim and italic; `/verbose`
+switches it in a session. By default it stays hidden.
+
+In a session, `/clear` forgets the conversation (a saved one stays saved; what follows goes to a
+new file), `/exit` or Ctrl-D quits, and Ctrl-C stops what is running (twice at the prompt quits); the model is told it was interrupted. Type while it works
 and your message is queued.
 
 On a terminal the prompt sits in a small block at the bottom: a line above it says what is going
@@ -81,7 +88,8 @@ The part it was written for: anything slow runs as a background task, and the ag
 `bash` with `run_in_background` returns a task number at once and writes the output to
 `.barb/tasks/N.log`. While it waits, Barb makes no model calls and uses no CPU (it sleeps in
 `select()`). When the task exits, or a `schedule_wakeup` timer fires, the model is woken with a message.
-Add `.barb/` to your `.gitignore`.
+Barb writes a `.gitignore` of `*` into `.barb/` when it first saves a conversation; before that,
+add `.barb/` to your own.
 
 It retries overloaded and failed requests with growing delays, caches the system prompt and the
 conversation so a long session pays for what is new, and keeps thinking blocks and any block type
@@ -125,9 +133,11 @@ then the release binary end to end.
 
 - `core/tests/json.rs`: the reader and writer (valid and invalid corpus, UTF-8 edge cases, the
   nesting limit, fuzz mutations);
-- `core/tests/api.rs`: the request body and reply parsing;
-- `core/tests/agent.rs`: scenarios for every tool and error path, interrupts in every state, and a
-  randomized chaos test of event orders. A fake model and a fake world run the whole agent, and
+- `core/tests/api.rs`: the request body, reply parsing, and saved conversations (the format and
+  the repair of a cut-off one);
+- `core/tests/agent.rs`: scenarios for every tool and error path, interrupts in every state,
+  saving and resuming, and a randomized chaos test of event orders (which also resumes whatever
+  was last saved, at whatever point that was). A fake model and a fake world run the whole agent, and
   every request it builds is checked against the rules the API enforces (see ARCHITECTURE.md);
 - `ui/tests/edit.rs`: the line editor, played on a terminal emulator in both of the console's
   wrapping modes, with a randomized run of keys;
@@ -143,7 +153,7 @@ then the release binary end to end.
   Windows, curl's replies, and the key wiped after use;
 - `tests/e2e.py`: the real binary against a fake API on localhost, including a pseudo-terminal
   session (a ConPTY on Windows) for the permission prompts, line editing, pastes, Ctrl-C and
-  Ctrl-Z, timeouts, what a command leaves running, retries, and checks that the API key is never on
+  Ctrl-Z, timeouts, what a command leaves running, retries, saving and resuming, and checks that the API key is never on
   a command line and never in the environment of a command the model runs.
 
 `tools/mutate.py` breaks the code on purpose in listed ways and checks that a test fails each
@@ -155,7 +165,6 @@ system it is on). Not tested: macOS, and sessions long enough to fill the contex
 - Replies are not streamed: you see the answer when it is complete.
 - No compaction: when the conversation outgrows the model's context window, the API says so and
   you `/clear`.
-- The conversation is not saved between runs.
 - A command that is not run in the background is killed, with its children, when it ends or after
   its timeout (default 2 minutes, at most 10). Background tasks are killed when Barb exits.
 - `edit_file` and `write_file` follow symbolic links and write atomically, but do not keep file

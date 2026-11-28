@@ -64,15 +64,15 @@ is limited.)
 |---|---|---|
 | `core/src/text.rs` | byte strings and the `cat!` macro | through everything else |
 | `core/src/json.rs` | validating pull reader, lookups, UTF-8-safe writer | `core/tests/json.rs` (corpus, UTF-8 cases, fuzz mutations) |
-| `core/src/api.rs` | transcript, request body, reply parsing | `core/tests/api.rs` |
-| `core/src/agent.rs` | the state machine: turns, retries, interrupts, background tasks, instructions | `core/tests/agent.rs` (scenarios, chaos) |
+| `core/src/api.rs` | transcript, request body, reply parsing, the saved-conversation format and its repair | `core/tests/api.rs` |
+| `core/src/agent.rs` | the state machine: turns, retries, interrupts, background tasks, instructions, saving and resuming | `core/tests/agent.rs` (scenarios, chaos) |
 | `core/src/tools.rs` | the six tools and their definitions | `core/tests/agent.rs` |
 | `ui/src/edit.rs` | the prompt's line editor: no I/O, it returns the bytes to draw | `ui/tests/edit.rs` (a terminal emulator, both wrapping modes, random keys) |
 | `ui/src/keys.rs` | turns a terminal's bytes into keys: escape sequences, UTF-8, bracketed paste; the caller times out a lone Escape | `ui/tests/keys.rs` |
 | `ui/src/md.rs` | markdown to styled, wrapped terminal text, one reply at a time; `safe` makes any text safe to print | `ui/tests/md.rs` (the emulator, every construct, hostile bytes, random input) |
 | `ui/src/screen.rs` | everything the program shows: the record, the activity line, the footer, the questions. It sees every action and event and keeps time only through the `now` it is given | `ui/tests/screen.rs` (both streams on the emulator, all three modes, random runs) |
 | `ui/tests/common/mod.rs` | a small terminal emulator (cursor, wrapping both ways, erases, tabs, the escapes Barb writes) that the ui tests play their output on | |
-| `barb/src/common.rs` | what both platforms share: the command line, the event queue, a command's kept output (head and tail), curl's arguments and config, its replies | unit tests there |
+| `barb/src/common.rs` | what both platforms share: the command line, which saved conversation to take up and where to save, the event queue, a command's kept output (head and tail), curl's arguments and config, its replies | unit tests there |
 | `barb/src/posix/sys.rs` | the C library calls std does not wrap, both Linux's and macOS's layouts; `wait`, the loop's select(2) behind poll's interface (Apple's poll() cannot watch a terminal) | unit tests there |
 | `barb/src/posix/ops.rs` | processes in their own process groups, curl, files written atomically, timers | unit tests there, `tests/e2e.py` |
 | `barb/src/posix/mod.rs` | arguments, the wait loop, the terminal in raw mode with bracketed paste, signals (Ctrl-C, Ctrl-Z, resize) through a self-pipe | `tests/e2e.py` (pipes, a pseudo-terminal, one under a job-control parent for Ctrl-Z) |
@@ -135,6 +135,23 @@ reads goes on without them. Because it is all actions and events, every platform
 Ctrl-C during a model call cancels it and adds "[barb] The user interrupted you here, before you
 replied." to the unanswered message, so the model does not take up the old request when the user
 types next. During tool calls, the running call and the ones after it get results that say so.
+
+## Saving and resuming
+
+The format is in `../docs/SESSIONS.md`, because the C version reads and writes the same files. The
+core saves with ordinary `Write` actions (atomic, parent directories made): when a request goes out
+(not a retry), when a reply is added, and after an interrupt changes the transcript. It keeps the
+ids of its own writes, so their `File` events go to `on_saved` and not to a tool; a failure is said
+once. The platform decides the path (`common::plan`: a new name, `-c`, `-r`) and hands it over in
+`Config::session`; after `/clear` the agent moves to the `-2`, `-3`, ... sibling itself.
+
+`Agent::resume(data, show)` comes before any event. It loads and repairs the transcript
+(`Transcript::repair`: a `tool_result` for every call that never got one), shows the last messages
+again if asked, and leaves a note that goes first in the next user message. The chaos test resumes
+whatever its random run last saved and checks that the next request keeps the rules above.
+
+Thinking blocks stay raw JSON in the transcript; `say_thinking` shows them as `Style::Thinking`
+only when `Config::verbose` is on (`-v`, or `/verbose`).
 
 ## Sleeping and waking
 
