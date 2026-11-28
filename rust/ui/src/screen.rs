@@ -738,6 +738,14 @@ impl Screen {
                     }
                     return;
                 }
+                if *style == Style::Model {
+                    self.model = clean(96, text).0;
+                    let mut t = b"Model: ".to_vec();
+                    t.extend_from_slice(text);
+                    t.extend_from_slice(b", from the next request.");
+                    self.say(Style::Info, &t);
+                    return;
+                }
                 self.say(*style, text);
             }
             Action::Http { id, .. } => {

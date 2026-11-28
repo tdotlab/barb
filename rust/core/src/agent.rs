@@ -99,6 +99,9 @@ pub enum Style {
     User,
     /// The model's thinking, shown only with `verbose`.
     Thinking,
+    /// `text` is the model now in use, after /model: a platform with a footer shows it there, and
+    /// all of them say it changed.
+    Model,
 }
 
 /// Something for the platform to do.
@@ -148,6 +151,8 @@ pub struct Config {
     pub session: Bytes,
     /// Show the model's thinking (Style::Thinking). /verbose turns it on and off.
     pub verbose: bool,
+    /// One of api::EFFORTS, or empty for the model's default. /effort changes it.
+    pub effort: Bytes,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -267,6 +272,10 @@ pub struct Agent {
 
 /// How many messages of a resumed conversation are shown again.
 const REPLAY_MSGS: usize = 40;
+
+/// What the prompt takes as a command, whatever follows it.
+const COMMANDS: [&[u8]; 7] = [b"/exit", b"/quit", b"/clear", b"/help", b"/verbose", b"/model", b"/effort"];
+const EFFORT_HELP: &str = "/effort LEVEL sets it: low, medium, high, xhigh or max; /effort default goes back.";
 
 /// The "@path" line `line`, or None.
 fn import_of(line: &[u8]) -> Option<&[u8]> {
@@ -589,6 +598,10 @@ impl Agent {
         let cfg = api::Cfg {
             model: &self.cfg.model,
             max_tokens: self.cfg.max_tokens,
+            effort: &self.cfg.effort,
+            // Asked for when the thinking is to be shown, or an effort is set (some models refuse
+            // the higher levels with thinking off). Turning it on or off costs one cache miss.
+            thinking: self.cfg.verbose || !self.cfg.effort.is_empty(),
             system: &self.system,
             tools: tools::TOOLS_JSON.as_bytes(),
         };
@@ -977,20 +990,59 @@ impl Agent {
         if line.first() != Some(&b'/') {
             return false;
         }
-        if [&b"/exit"[..], b"/quit", b"/clear", b"/help", b"/verbose"].iter().any(|c| line.starts_with(c)) {
+        let (word, arg) = Self::split_command(line);
+        if COMMANDS.contains(&word) {
             return true;
         }
         // One word starting with /: a mistyped command. With a space: a prompt that mentions a path.
-        !line.iter().any(|&c| c == b' ' || c == b'\t')
+        arg.is_empty() && !line.iter().any(|&c| c == b' ' || c == b'\t')
+    }
+
+    /// The first word and the rest, trimmed.
+    fn split_command(line: &[u8]) -> (&[u8], &[u8]) {
+        match line.iter().position(|&c| c == b' ' || c == b'\t') {
+            Some(i) => (&line[..i], text::trim(&line[i..])),
+            None => (line, b""),
+        }
     }
 
     fn run_command(&mut self, line: &[u8]) {
-        match line {
-            b"/exit" | b"/quit" => {
+        let (word, arg) = Self::split_command(line);
+        match (word, arg) {
+            (b"/model", b"") => {
+                let t = cat!("Model: ", &self.cfg.model[..], ". /model NAME changes it.");
+                self.say(Style::Info, t);
+            }
+            (b"/model", name) => {
+                self.cfg.model = name.to_vec();
+                self.say(Style::Model, name.to_vec());
+            }
+            (b"/effort", b"") => {
+                let t = if self.cfg.effort.is_empty() {
+                    cat!("Effort: the model's default. ", EFFORT_HELP)
+                } else {
+                    cat!("Effort: ", &self.cfg.effort[..], ". ", EFFORT_HELP)
+                };
+                self.say(Style::Info, t);
+            }
+            (b"/effort", b"default") => {
+                self.cfg.effort.clear();
+                self.say(Style::Info, "Effort: the model's default, from the next request.");
+            }
+            (b"/effort", level) if api::is_effort(level) => {
+                self.cfg.effort = level.to_vec();
+                let t = cat!("Effort: ", level, ", from the next request.");
+                self.say(Style::Info, t);
+            }
+            (b"/effort", level) => {
+                let t = cat!("Unknown effort ", level, ". ", EFFORT_HELP);
+                self.say(Style::Error, t);
+            }
+            (b"/exit" | b"/quit", b"") => {
                 self.emit(Action::Done { status: 0 });
                 self.done = true;
             }
-            b"/clear" => {
+            (b"/clear", b"") => {
                 if self.state != State::Idle {
                     self.say(Style::Error, "Busy: wait for the current step, or press Ctrl-C, before /clear.");
                     return;
@@ -1005,16 +1057,21 @@ impl Agent {
                 self.turns = 0;
                 self.say(Style::Info, "Conversation cleared. Background tasks and timers are still running.");
             }
-            b"/verbose" => {
+            (b"/verbose", b"") => {
                 self.cfg.verbose = !self.cfg.verbose;
                 self.say(
                     Style::Info,
                     if self.cfg.verbose { "Verbose: the model's thinking is shown." } else { "Verbose off: thinking is hidden." },
                 );
             }
-            b"/help" => self.say(
+            (b"/help", b"") => self.say(
                 Style::Info,
-                "/clear    forget the conversation (a saved one stays saved)\n/verbose  show or hide the model's thinking\n/exit     quit (also Ctrl-D)\nCtrl-C    stop what is running; twice at the prompt to quit",
+                "/clear           forget the conversation (a saved one stays saved)\n\
+                 /verbose         show or hide the model's thinking\n\
+                 /model [NAME]    show or change the model\n\
+                 /effort [LEVEL]  show or set the effort: low, medium, high, xhigh, max, or default\n\
+                 /exit            quit (also Ctrl-D)\n\
+                 Ctrl-C           stop what is running; twice at the prompt to quit",
             ),
             _ => {
                 let t = cat!("Unknown command ", line, ". Try /help.");

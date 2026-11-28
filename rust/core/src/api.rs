@@ -65,9 +65,22 @@ impl Transcript {
     }
 }
 
+/// The effort levels the API takes in `output_config.effort`, least first.
+pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// Whether `s` is one of [`EFFORTS`].
+pub fn is_effort(s: &[u8]) -> bool {
+    EFFORTS.iter().any(|e| e.as_bytes() == s)
+}
+
 pub struct Cfg<'a> {
     pub model: &'a [u8],
     pub max_tokens: i64,
+    /// One of [`EFFORTS`], sent as `output_config.effort`; empty for the model's default.
+    pub effort: &'a [u8],
+    /// Send `thinking: {type: adaptive, display: summarized}`: adaptive thinking, with its text
+    /// returned (Claude models from Opus 4.7 on return it empty unless asked).
+    pub thinking: bool,
     pub system: &'a [u8],
     /// A JSON array of tool definitions, as text; empty for none.
     pub tools: &'a [u8],
@@ -147,6 +160,22 @@ pub fn request(cfg: &Cfg, t: &Transcript) -> Vec<u8> {
     w.str(cfg.model);
     w.key("max_tokens");
     w.int(cfg.max_tokens);
+    if cfg.thinking {
+        w.key("thinking");
+        w.obj();
+        w.key("type");
+        w.str("adaptive");
+        w.key("display");
+        w.str("summarized");
+        w.obj_end();
+    }
+    if !cfg.effort.is_empty() {
+        w.key("output_config");
+        w.obj();
+        w.key("effort");
+        w.str(cfg.effort);
+        w.obj_end();
+    }
     if !cfg.system.is_empty() {
         w.key("system");
         w.arr();

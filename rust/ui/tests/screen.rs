@@ -841,3 +841,25 @@ fn user_and_thinking() {
     );
     assert!(escapes_ok(&x.out));
 }
+
+// ---- /model ----
+
+#[test]
+fn model_change() {
+    // Region: said in the record, and the footer shows the new one from then on.
+    let mut x = setup_full(Mode::Region, true, 100, true, false, b"m1", b"/home/t/proj", Some(b"/home/t"));
+    x.draw(0, false, true, true);
+    x.check_block(0, "", ">", "  m1 · ~/proj", "/help for commands");
+    x.act(sayact(Style::Model, 0, b"m2-\x1b[31mred"), 0);
+    assert!(x.find_row("Model: m2-^[[31mred, from the next request.").is_some(), "said, made safe");
+    x.draw(0, false, true, true);
+    assert!(x.find_row("  m2- [31mred · ~/proj").is_some(), "the footer has it, cleaned as at the start");
+    assert!(x.find_row("  m1 ·").is_none());
+    assert!(escapes_ok(&x.out));
+
+    // Pipe: a plain line on standard error, nothing on standard output.
+    let mut x = setup(Mode::Pipe, false, 80);
+    x.act(sayact(Style::Model, 0, b"m2"), 0);
+    assert_eq!(String::from_utf8_lossy(&x.fd2), "Model: m2, from the next request.\n");
+    assert!(x.fd1.is_empty());
+}

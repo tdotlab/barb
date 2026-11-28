@@ -11,6 +11,8 @@ fn request() {
     let cfg = Cfg {
         model: b"claude-test",
         max_tokens: 1000,
+        effort: b"",
+        thinking: false,
         system: b"You are Barb.",
         tools: b"[{\"name\":\"bash\"}]",
     };
@@ -99,10 +101,38 @@ fn request() {
     assert!(json::valid(&api::request(&cfg, &t4)));
 
     // No system prompt and no tools: those keys are left out.
-    let bare = Cfg { model: b"m", max_tokens: 5, system: b"", tools: b"" };
+    let bare = Cfg { model: b"m", max_tokens: 5, effort: b"", thinking: false, system: b"", tools: b"" };
     let body = api::request(&bare, &t4);
     assert!(json::get(&body, "system").is_none());
     assert!(json::get(&body, "tools").is_none());
+    // No effort and no thinking: left out too, so the model's defaults hold.
+    assert!(json::get(&body, "output_config").is_none());
+    assert!(json::get(&body, "thinking").is_none());
+}
+
+#[test]
+fn request_effort_and_thinking() {
+    let mut t = Transcript::default();
+    t.user_msg().add_text(b"hi");
+    let cfg = Cfg { model: b"m", max_tokens: 5, effort: b"xhigh", thinking: false, system: b"", tools: b"" };
+    let body = api::request(&cfg, &t);
+    assert!(json::valid(&body));
+    assert_eq!(s(json::get(&body, "output_config").unwrap()), "{\"effort\":\"xhigh\"}");
+    assert!(json::get(&body, "thinking").is_none(), "effort alone does not ask for thinking here");
+
+    let cfg = Cfg { model: b"m", max_tokens: 5, effort: b"", thinking: true, system: b"", tools: b"" };
+    let body = api::request(&cfg, &t);
+    assert!(json::valid(&body));
+    assert_eq!(s(json::get(&body, "thinking").unwrap()), "{\"type\":\"adaptive\",\"display\":\"summarized\"}");
+    assert!(json::get(&body, "output_config").is_none());
+
+    for e in api::EFFORTS {
+        assert!(api::is_effort(e.as_bytes()));
+    }
+    assert_eq!(api::EFFORTS, ["low", "medium", "high", "xhigh", "max"]);
+    for bad in [&b""[..], b"High", b"none", b"default", b"medium "] {
+        assert!(!api::is_effort(bad), "{:?}", s(bad));
+    }
 }
 
 #[test]
@@ -134,7 +164,7 @@ fn reply() {
 
     // The round trip: a parsed reply goes back into a request unchanged.
     let t = Transcript { msgs: vec![r.msg] };
-    let cfg = Cfg { model: b"m", max_tokens: 10, system: b"", tools: b"" };
+    let cfg = Cfg { model: b"m", max_tokens: 10, effort: b"", thinking: false, system: b"", tools: b"" };
     assert_eq!(
         s(json::get(&api::request(&cfg, &t), "messages").unwrap()),
         concat!(
@@ -209,7 +239,7 @@ fn session_round_trip() {
     assert_eq!(got.cwd, b"C:\\w");
     assert_eq!(got.tr.msgs.len(), 3);
     // the same conversation: the same request, the same file
-    let cfg = Cfg { model: b"m", max_tokens: 1, system: b"", tools: b"" };
+    let cfg = Cfg { model: b"m", max_tokens: 1, effort: b"", thinking: false, system: b"", tools: b"" };
     assert_eq!(s(&api::request(&cfg, &got.tr)), s(&api::request(&cfg, &t)));
     assert_eq!(s(&api::session(b"m1", b"C:\\w", &got.tr)), s(&f));
     match &got.tr.msgs[2].blocks[1] {

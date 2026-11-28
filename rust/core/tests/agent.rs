@@ -146,6 +146,7 @@ impl World {
             instructions,
             session: Vec::new(),
             verbose: false,
+            effort: Vec::new(),
         };
         World::with(cfg)
     }
@@ -1846,4 +1847,88 @@ fn verbose_shows_thinking() {
     w.reply(&mk_reply("end_turn", "[{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"s\"},{\"type\":\"text\",\"text\":\"A\"}]"), 200);
     w.input("q");
     assert!(!w.says.iter().any(|x| x.0 == Style::Thinking));
+}
+
+#[test]
+fn model_and_effort() {
+    let body_has = |w: &World, k: &str| json::get(w.last_body().as_bytes(), k).map(|v| s(v));
+    let mut w = World::saving("m.json");
+    w.reply_text("a");
+    w.input("one");
+    assert_eq!(body_has(&w, "output_config"), None, "no effort: the model's default");
+    assert_eq!(body_has(&w, "thinking"), None, "and no thinking asked for");
+
+    w.input("/model");
+    assert!(w.said("Model: claude-test. /model NAME changes it."));
+    w.input("/model  claude-other ");
+    assert_eq!(w.says.last().unwrap(), &(Style::Model, "claude-other".to_string()), "trimmed, said as a Model");
+    w.reply_text("b");
+    w.input("two");
+    assert_eq!(body_has(&w, "model").as_deref(), Some("\"claude-other\""));
+    assert!(w.file("m.json").unwrap().contains("\"model\":\"claude-other\""), "saved with the new model");
+
+    w.input("/effort");
+    assert!(w.said("Effort: the model's default. /effort LEVEL sets it"));
+    w.input("/effort high");
+    assert!(w.said("Effort: high, from the next request."));
+    w.input("/effort");
+    assert!(w.said("Effort: high. /effort LEVEL"));
+    w.input("/effort extreme");
+    assert_eq!(w.says.last().unwrap().0, Style::Error);
+    assert!(w.said("Unknown effort extreme. /effort LEVEL sets it: low, medium, high, xhigh or max"));
+    w.reply_text("c");
+    w.input("three");
+    assert_eq!(body_has(&w, "output_config").as_deref(), Some("{\"effort\":\"high\"}"), "a bad level changed nothing");
+    assert_eq!(
+        body_has(&w, "thinking").as_deref(),
+        Some("{\"type\":\"adaptive\",\"display\":\"summarized\"}"),
+        "an effort asks for thinking"
+    );
+    w.input("/effort default");
+    assert!(w.said("Effort: the model's default, from the next request."));
+    w.reply_text("d");
+    w.input("four");
+    assert_eq!(body_has(&w, "output_config"), None);
+    assert_eq!(body_has(&w, "thinking"), None);
+    // verbose asks for thinking (with its text), but sets no effort
+    w.input("/verbose");
+    w.reply_text("e");
+    w.input("five");
+    assert!(body_has(&w, "thinking").is_some());
+    assert_eq!(body_has(&w, "output_config"), None);
+
+    // from the start, as --effort gives it
+    let mut cfg = test_cfg();
+    cfg.effort = b"max".to_vec();
+    let mut w = World::with(cfg);
+    w.reply_text("a");
+    w.input("q");
+    assert_eq!(body_has(&w, "output_config").as_deref(), Some("{\"effort\":\"max\"}"));
+
+    // changed while the model is asked: the next request has it, the one out does not change
+    let mut w = World::new(true);
+    w.hold_http = true;
+    w.input("slow");
+    let id = w.last_op(Kind::Http);
+    w.input("/model fast-one");
+    w.input("/effort low");
+    assert!(w.says.iter().any(|x| x == &(Style::Model, "fast-one".to_string())), "changed while busy");
+    w.hold_http = false;
+    let r = mk_reply("tool_use", &format!("[{}]", tool("t1", "bash", r#"{"command":"true"}"#)));
+    w.reply_text("done");
+    w.procs.push(("true", vec![], 0, 0));
+    w.http(id, 200, &r);
+    assert_eq!(body_has(&w, "model").as_deref(), Some("\"fast-one\""));
+    assert_eq!(body_has(&w, "output_config").as_deref(), Some("{\"effort\":\"low\"}"));
+
+    // only the command words are commands: a prompt may start with one's letters
+    let mut w = World::new(true);
+    w.reply_text("sure");
+    let n = w.bodies.len();
+    w.input("/models are listed where?");
+    assert_eq!(w.bodies.len(), n + 1, "a question, not a command");
+    w.input("/modelx");
+    assert!(w.said("Unknown command /modelx"));
+    w.input("/help");
+    assert!(w.said("/model [NAME]") && w.said("/effort [LEVEL]"));
 }

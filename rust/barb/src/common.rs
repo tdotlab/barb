@@ -81,6 +81,7 @@ pub struct Args {
     /// List the saved conversations and exit.
     pub sessions: bool,
     pub verbose: bool,
+    pub effort: Option<OsString>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -128,6 +129,9 @@ pub fn parse(argv: &[OsString]) -> Parsed {
         } else if (is("-C") || is("--cwd")) && val.is_some() {
             a.cwd = val;
             i += 1;
+        } else if is("--effort") && val.is_some() {
+            a.effort = val;
+            i += 1;
         } else if is("--max-turns") && val.is_some() {
             a.max_turns = atoi(&val.unwrap().to_string_lossy());
             i += 1;
@@ -137,6 +141,17 @@ pub fn parse(argv: &[OsString]) -> Parsed {
         i += 1;
     }
     Parsed::Run(a)
+}
+
+/// The effort to start with: --effort, else `env` ($BARB_EFFORT), else none (the model's default).
+/// An empty value counts as none; anything else must be one of the API's levels.
+pub fn effort(a: &Args, env: Option<OsString>) -> Result<Vec<u8>, String> {
+    let v = a.effort.clone().or(env).map(|v| v.to_string_lossy().into_owned()).unwrap_or_default();
+    if v.is_empty() || barb_core::api::is_effort(v.as_bytes()) {
+        Ok(v.into_bytes())
+    } else {
+        Err(format!("unknown effort {:?}: use one of {}", v, barb_core::api::EFFORTS.join(", ")))
+    }
 }
 
 /// As C's atoi: leading blanks, a sign, digits; 0 when there are none.
@@ -550,6 +565,23 @@ mod tests {
         assert!(run(&["--verbose"]).verbose);
         let a = run(&[]);
         assert!(!a.no_save && !a.sessions && !a.verbose);
+    }
+
+    #[test]
+    fn effort_option() {
+        let run = |v: &[&str]| match parse(&os(v)) {
+            Parsed::Run(a) => a,
+            p => panic!("{:?}", p),
+        };
+        assert_eq!(parse(&os(&["--effort"])), Parsed::Bad("--effort".into()), "a level is needed");
+        assert_eq!(effort(&run(&[]), None), Ok(vec![]), "none: the model's default");
+        assert_eq!(effort(&run(&["--effort", "high"]), None), Ok(b"high".to_vec()));
+        assert_eq!(effort(&run(&[]), Some("xhigh".into())), Ok(b"xhigh".to_vec()), "from the environment");
+        assert_eq!(effort(&run(&["--effort", "low"]), Some("max".into())), Ok(b"low".to_vec()), "the option wins");
+        assert_eq!(effort(&run(&[]), Some("".into())), Ok(vec![]), "an empty variable is none");
+        let e = effort(&run(&["--effort", "hgih"]), None).unwrap_err();
+        assert!(e.contains("\"hgih\"") && e.contains("low, medium, high, xhigh, max"), "{}", e);
+        assert!(effort(&run(&[]), Some("HIGH".into())).is_err(), "levels are lower case");
     }
 
     #[test]

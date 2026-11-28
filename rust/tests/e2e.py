@@ -243,6 +243,7 @@ def test_files_and_bash():
     out, err = result_of(fake.requests[2], "toolu_read_file_1")
     check(out is not None and "1\théllo there ✓" in out, f"read result {out!r}")
     check(fake.requests[0]["model"] == "claude-sonnet-5-5", "default model")
+    check("output_config" not in fake.requests[0] and "thinking" not in fake.requests[0], "no effort or thinking by default")
     check(fake.requests[0]["tools"][0]["name"] == "read_file", "tools sent")
     check("Working directory: " + os.path.realpath(d) in fake.requests[0]["system"][0]["text"], "system prompt names the directory")
     no_problems(fake, "files_and_bash")
@@ -394,11 +395,15 @@ def test_permissions_and_errors():
 def test_interactive_pipe():
     d = tempfile.mkdtemp()
     fake = Fake([text("Hi, I am a fake."), text("You said world.")])
-    p, _ = run(fake, ["--yes"], d, stdin="hello\nworld\n")
+    p, _ = run(fake, ["--yes"], d, stdin="hello\n/model piped-m\n/effort max\nworld\n")
     check(p.returncode == 0, f"exit {p.returncode}: {p.stderr}")
     check("Hi, I am a fake." in p.stdout and "You said world." in p.stdout, f"stdout {p.stdout!r}")
     check(len(fake.requests) == 2, f"{len(fake.requests)} requests")
     check(fake.requests[1]["messages"][-1]["content"][0]["text"] == "world", "second message")
+    # (the first request may be built after /model is read: AGENTS.md is looked for first)
+    check(fake.requests[1]["model"] == "piped-m", "/model")
+    check(fake.requests[1].get("output_config") == {"effort": "max"}, "/effort")
+    check("Model: piped-m, from the next request." in p.stderr and "Effort: max" in p.stderr, f"stderr {p.stderr!r}")
     p, _ = run(fake, ["--yes"], d, stdin="/exit\n")
     check(p.returncode == 0, "/exit")
     fake.stop()
@@ -816,6 +821,29 @@ def test_startup_errors():
     check(p.returncode == 0 and p.stdout.startswith("barb "), "version")
 
 
+def test_effort():
+    d = tempfile.mkdtemp()
+    fake = Fake([text("a"), text("b"), text("c")])
+    p, _ = run(fake, ["-p", "x", "--effort", "hgih", "--no-save"], d)
+    check(p.returncode == 2 and "unknown effort" in p.stderr and "xhigh" in p.stderr, f"bad effort: {p.returncode} {p.stderr!r}")
+    check(not fake.requests, "nothing sent for a bad effort")
+    p, _ = run(fake, ["-p", "x", "--effort", "high", "--no-save"], d)
+    check(p.returncode == 0, f"exit status {p.returncode}: {p.stderr}")
+    r = fake.requests[-1] if fake.requests else {}
+    check(r.get("output_config") == {"effort": "high"}, f"effort sent: {r.get('output_config')}")
+    check(r.get("thinking") == {"type": "adaptive", "display": "summarized"}, f"thinking asked for: {r.get('thinking')}")
+    env = env_for(fake)
+    env["BARB_EFFORT"] = "xhigh"
+    p = subprocess.run([BARB, "-p", "x", "--no-save"], cwd=d, env=env, capture_output=True, **TEXT, timeout=60)
+    check(p.returncode == 0 and len(fake.requests) == 2 and fake.requests[-1].get("output_config") == {"effort": "xhigh"},
+          f"BARB_EFFORT: {p.returncode} {p.stderr!r}")
+    p = subprocess.run([BARB, "-p", "x", "--no-save", "--effort", "low"], cwd=d, env=env, capture_output=True, **TEXT, timeout=60)
+    check(p.returncode == 0 and len(fake.requests) == 3 and fake.requests[-1].get("output_config") == {"effort": "low"},
+          f"--effort over BARB_EFFORT: {p.returncode} {p.stderr!r}")
+    no_problems(fake, "effort")
+    fake.stop()
+
+
 def test_sessions():
     d = tempfile.mkdtemp()
     sd = os.path.join(d, ".barb", "sessions")
@@ -897,7 +925,7 @@ def test_sessions():
 if __name__ == "__main__":
     for t in (test_startup_errors, test_files_and_bash, test_key_not_inherited, test_background_wake, test_timeout_and_interrupt,
               test_leftovers_killed, test_permissions_and_errors, test_interactive_pipe, test_interactive_interrupt, test_interactive_permissions,
-              test_one_key_typeahead, test_line_editing, test_paste, test_suspend, test_instructions, test_sessions):
+              test_one_key_typeahead, test_line_editing, test_paste, test_suspend, test_instructions, test_effort, test_sessions):
         t()
     print(f"e2e: {checks} checks, {failed} failed")
     sys.exit(1 if failed else 0)

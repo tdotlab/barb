@@ -28,8 +28,10 @@ target/release/barb -p "fix the failing test in tests/foo.c" --yes
 ```
 
 Options: `-p TASK` (do one task and exit; `-` reads it from standard input), `-m MODEL` (default
-`claude-sonnet-5-5`, or `$BARB_MODEL`), `-y/--yes` (do not ask before writing files or running
-commands), `-C DIR`, `--max-turns N` (model calls per message without you typing; default 60).
+`claude-sonnet-5-5`, or `$BARB_MODEL`), `--effort LEVEL` (`low`, `medium`, `high`, `xhigh` or
+`max`, or `$BARB_EFFORT`; unset, the model's default), `-y/--yes` (do not ask before writing files
+or running commands), `-C DIR`, `--max-turns N` (model calls per message without you typing;
+default 60).
 `ANTHROPIC_BASE_URL` points it at another endpoint (the tests use a fake one on localhost).
 DeepSeek works through its Anthropic-compatible route: `ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic`
 with `-m deepseek-flash` (checked live: tools, caching, thinking blocks and background wake-ups all behave).
@@ -41,10 +43,14 @@ the window loses nothing: `barb -c` takes up the last one, `barb -r NAME` a give
 `barb --sessions` lists them (`--no-save` saves nothing). An interactive run ends by saying the
 name. The format, shared with the C version, is in `../docs/SESSIONS.md`. `-v`/`--verbose` shows
 the model's thinking (DeepSeek's reasoning, Claude's thinking blocks) dim and italic; `/verbose`
-switches it in a session. By default it stays hidden.
+switches it in a session. By default it stays hidden. Verbose, or an effort, also asks for
+adaptive thinking with its text (`thinking: {type: adaptive, display: summarized}`), since newer
+Claude models send thinking with no text otherwise; on a model where thinking is optional, that
+turns it on.
 
 In a session, `/clear` forgets the conversation (a saved one stays saved; what follows goes to a
-new file), `/exit` or Ctrl-D quits, and Ctrl-C stops what is running (twice at the prompt quits); the model is told it was interrupted. Type while it works
+new file), `/model NAME` and `/effort LEVEL` change the model and the effort from the next request
+(alone, they say what is set; `/effort default` goes back to the model's), `/exit` or Ctrl-D quits, and Ctrl-C stops what is running (twice at the prompt quits); the model is told it was interrupted. Type while it works
 and your message is queued.
 
 On a terminal the prompt sits in a small block at the bottom: a line above it says what is going

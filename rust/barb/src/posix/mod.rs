@@ -633,7 +633,8 @@ fn usage(to_err: bool) {
         "barb {}: a coding agent for the terminal\n\n\
          usage: barb [options]\n       barb -p TASK [options]\n\n\
          \x20 -p, --prompt TASK   do one task and exit (TASK of - reads it from standard input)\n\
-         \x20 -m, --model NAME    the model (default {}, or $BARB_MODEL)\n\
+         \x20 -m, --model NAME    the model (default {}, or $BARB_MODEL; /model changes it)\n\
+         \x20     --effort LEVEL  low, medium, high, xhigh or max (or $BARB_EFFORT; /effort changes it)\n\
          \x20 -y, --yes           do not ask before writing files or running commands\n\
          \x20 -C, --cwd DIR       work in DIR\n\
          \x20     --max-turns N   stop after N model calls without you typing (default 60)\n\
@@ -645,7 +646,7 @@ fn usage(to_err: bool) {
          \x20 -v, --verbose       show the model's thinking (/verbose switches it)\n\
          \x20 -V, --version\n\
          \x20 -h, --help\n\n\
-         environment: ANTHROPIC_API_KEY (required), ANTHROPIC_BASE_URL, BARB_MODEL\n",
+         environment: ANTHROPIC_API_KEY (required), ANTHROPIC_BASE_URL, BARB_MODEL, BARB_EFFORT\n",
         VERSION, DEFAULT_MODEL
     );
     write_all(if to_err { 2 } else { 1 }, text.as_bytes());
@@ -706,6 +707,13 @@ pub fn main() -> i32 {
     if !chosen && !plan.model.is_empty() {
         model = plan.model.clone(); // go on with the model it was saved with
     }
+    let effort = match common::effort(&args, std::env::var_os("BARB_EFFORT")) {
+        Ok(e) => e,
+        Err(e) => {
+            write_all(2, format!("barb: {}\n", e).as_bytes());
+            return 2;
+        }
+    };
 
     // Take the key out of the environment: every command the model runs inherits it otherwise,
     // and `echo $ANTHROPIC_API_KEY` would show it. Only the platform layer holds it from here.
@@ -795,6 +803,7 @@ pub fn main() -> i32 {
             instructions: !args.no_instructions,
             session: plan.path.clone(),
             verbose: args.verbose,
+            effort,
         }),
         scr: Screen::new(ScreenConfig {
             mode,

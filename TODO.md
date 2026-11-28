@@ -26,9 +26,6 @@ command's leftovers are killed. Sonnet medium.
 
 ## Rust
 
-**The model and the effort, from the prompt.** `/model NAME` and an effort level (`--effort`,
-`/effort`) sent as `output_config.effort`. Sonnet medium.
-
 **Streaming replies.** The biggest gap in daily use: a long answer arrives after a minute of the
 waiting line. Show text as it is written, and lift the non-streaming limit on long replies.
 A server-sent-events parser in the core (host-tested against recorded streams), partial tool input

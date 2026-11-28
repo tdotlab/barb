@@ -153,6 +153,25 @@ whatever its random run last saved and checks that the next request keeps the ru
 Thinking blocks stay raw JSON in the transcript; `say_thinking` shows them as `Style::Thinking`
 only when `Config::verbose` is on (`-v`, or `/verbose`).
 
+## The model, the effort and thinking
+
+`Config::model` and `Config::effort` are only read when a request is built (`post_request`), so
+`/model NAME` and `/effort LEVEL` take effect with the next request, even one built while a turn
+is under way. `/model` says `Style::Model` with the bare name, and the screen puts it in the footer.
+The effort is one of `api::EFFORTS` (low to max), sent as `output_config.effort`; empty means
+the key is left out and the model's default holds. The platform checks `--effort` and
+`$BARB_EFFORT` with `common::effort` and refuses a bad level at startup.
+
+`thinking: {type: adaptive, display: summarized}` is sent when verbose is on or an effort is set,
+and left out otherwise. With verbose, it is there because Claude models since Opus 4.7 return
+thinking blocks with no text unless `display` asks for it, so verbose would show nothing. With an
+effort, it is there because some models refuse the higher levels when thinking is off. The cost:
+on a model where thinking is optional (DeepSeek takes `adaptive` as "enabled"), `-v` turns it on;
+and switching it mid-conversation spoils the message cache for one request. Changing the model
+mid-conversation is safe on the Claude API (thinking blocks a model cannot read are dropped, not
+refused); other providers' blocks carry no Claude signature, so going from one to the other is
+untested.
+
 ## Sleeping and waking
 
 `bash` with `run_in_background` starts a process whose output goes to `.barb/tasks/N.log` and
