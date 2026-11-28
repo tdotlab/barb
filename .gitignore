@@ -1,4 +1,5 @@
+build/
+target/
 .barb/
 *.barb-tmp-*
 __pycache__/
-target/

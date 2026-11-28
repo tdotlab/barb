@@ -1,19 +1,31 @@
 # To do
 
-Where Barb stands: v0.2.0, in Rust (the C version's behaviour, port finished 2026-11-24; see
-docs/RUST_PORT.md). The core, six tools and the Linux/macOS and Windows platforms pass the same
-tests the C version did, and every mutation in `tools/mutate.py` is caught on both systems. The C
-version did real tasks against a live model (DeepSeek through its Anthropic-compatible route):
-multi-file fixes, a refactor, CRLF edits, a 7,000-line file, background builds and servers, timers,
-and interactive sessions. Each task below stands on its own. Model suggestions are for Claude and
-Codex: [Claude: Haiku, Sonnet, Opus] [Codex: Luna, Sol].
+Barb has two versions (`docs/VERSIONS.md`): `rust/` gets new features, `c/` stays the one built
+into RingTail and gets fixes and what T asks for there. Both are at v0.2.0 and pass their tests on
+Linux and Windows, with every mutation caught. Each task below stands on its own. Model suggestions
+are for Claude and Codex: [Claude: Haiku, Sonnet, Opus] [Codex: Luna, Sol].
 
-**A live run of the Rust build.** Before anything else: one real task against a live model on
-Linux and one on Windows, interactive, with a background task and a Ctrl-C, as the C version had.
-The tests cover the same ground, but a live run is what found the C version's last bugs. Sonnet
-medium, Codex Luna medium.
+## Both
 
-## Next
+**A live run of the Rust build.** One real task against a live model on Linux and one on Windows,
+interactive, with a background task and a Ctrl-C, as the C version had. The tests cover the same
+ground, but a live run is what found the C version's last bugs. Sonnet medium, Codex Luna medium.
+
+**Saved sessions.** Write the conversation to disk as it goes and resume it (`--continue`,
+`--resume`), in both versions and in one format, so closing the window loses nothing. Sonnet high.
+
+**Verbose: show the thinking.** An option and a command that print the model's thinking blocks
+(DeepSeek's reasoning, for one) as they come back, in both versions. Sonnet medium.
+
+**The port's fixes, in C.** The Rust port found three things the C version still has: the
+plain-http warning matches `http://localhost.evil.com` as local (parse the host), the atomic-write
+test looks for leftovers in the wrong directory, and no end-to-end test checks that a foreground
+command's leftovers are killed. Sonnet medium.
+
+## Rust
+
+**The model and the effort, from the prompt.** `/model NAME` and an effort level (`--effort`,
+`/effort`) sent as `output_config.effort`. Sonnet medium.
 
 **Streaming replies.** The biggest gap in daily use: a long answer arrives after a minute of the
 waiting line. Show text as it is written, and lift the non-streaming limit on long replies.
@@ -25,18 +37,13 @@ The design is the hard part. Opus high, Codex Sol high.
 conversation (a model call with no tools) and replace it, keeping recent turns whole. The transcript
 is a plain `Vec` now, so dropping the old part frees it. Opus high, Codex Sol high.
 
-**Saved sessions.** Write the transcript to `.barb/sessions/` and resume it (`--resume`). Sonnet high.
-
 **Permissions you can set.** A settings file (`.barb/settings.json`) with allow and deny lists, so
 `git status` and the test command do not ask every time. Sonnet high.
 
 **More tools.** `glob` and `grep` as tools (the model can use bash, but a dedicated tool has bounded,
 sorted output), and `list_dir`. Sonnet high, Codex Luna high.
 
-**Extended thinking.** The request parameter and showing the thinking; the blocks are already kept
-and sent back intact. Sonnet medium.
-
-## Platforms
+## Rust: platforms
 
 **Windows, what is left.** Barb runs there (barb/src/win32), and the C version did a live task
 against DeepSeek from Windows (2026-11-22: found cl through vswhere, worked around MSYS mangling
@@ -58,14 +65,19 @@ completion message had already woken it, which cost four extra model calls. The 
 description should say that a finished background task wakes the model by itself, so a timer to
 check on it is wasted. Sonnet medium; check it live.
 
-**RingTail in Rust.** RingTail runs the C version, from its own copy in `vendor/barb`, so it no
-longer gets Barb's changes. `barb-core` and `barb-ui` are `no_std` and need only an allocator; what
-is missing is a Rust target for RingTail (a target spec, `core` and `alloc` built for it, a global
-allocator over its heap) and a platform module like `barb/src/posix` for its jobs, `fetch` and
-`/barb.cfg`. Still to do from the C days as well: a real HTTPS run from a RingTail machine to the
-API itself, and MicroPython there. Opus high for the target, Codex Sol high.
+**RingTail in Rust, as an optional program.** RingTail ships the C version; the Rust one could be
+installed on top. `barb-core` and `barb-ui` are `no_std` and need only an allocator; what is missing
+is a Rust target for RingTail (a target spec, `core` and `alloc` built for it, a global allocator
+over its heap) and a platform module like `barb/src/posix` for its jobs, `fetch` and `/barb.cfg`.
+Opus high for the target, Codex Sol high.
 
-## Tests worth adding
+## C
+
+**RingTail's copy.** `c/tools/to_ringtail.sh PATH/TO/RINGTAIL` copies the core and the RingTail
+platform into RingTail's `vendor/barb`. Run it after a change here, then RingTail's `make test`.
+Still to do from before: a real HTTPS run from a RingTail machine to the API itself.
+
+## Tests worth adding (both)
 
 **macOS.** Run `python3 tools/test.py` on a Mac. The C version was checked under clang on Linux; the Rust one not at all
 there. The loop waits with
