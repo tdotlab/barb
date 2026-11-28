@@ -8,12 +8,20 @@
 //   - the conversation never gets an empty message;
 //   - text that arrives while a step is running (the user typing, a task that
 //     finished) is queued and joins the next user message, after the results.
+// It also saves the conversation (docs/SESSIONS.md), takes a saved one up
+// again, and has it compacted when it grows too big (compact.h).
 #include "agent_int.h"
+#include "compact.h"
 #include <string.h>
 
 #define DEFAULT_MAX_TOKENS 16384
 #define DEFAULT_MAX_TURNS 60
 #define MAX_RETRIES 5
+#define REPLAY_MSGS 40   // how many messages of a resumed conversation are shown again
+
+#define INTERRUPTED_NOTE "[barb] The user interrupted you here, before you replied."
+#define COMPACT_HELP "/compact compacts it now (add what the summary should keep in view, if you like); " \
+    "/compact at N sets when it happens by itself, as a token count such as 200000 or 200k; /compact off stops that."
 
 // ---- small services ----
 
@@ -85,6 +93,8 @@ static void queue_note(agent_t* g, str_t text, int from_user) {
 // Move the queued text into user message `m`. Returns 1 if any of it was the user's own.
 static int flush_notes(agent_t* g, msg_t* m) {
     int user = 0;
+    tr_add_text(&g->life, m, g->resume_note);
+    g->resume_note = str_of(0, 0);
     for (note_t* n = g->nhead; n; n = n->next) {
         tr_add_text(&g->life, m, n->text);
         if (n->from_user) user = 1;
@@ -162,8 +172,12 @@ agent_t* agent_new(const mem_t* mem, const agent_cfg_t* cfg) {
     g->cfg.cwd = str_dup(&g->life, cfg->cwd);
     g->cfg.platform = str_dup(&g->life, cfg->platform);
     g->cfg.date = str_dup(&g->life, cfg->date);
+    g->cfg.session = str_dup(&g->life, cfg->session);
+    g->sess_path = g->cfg.session;
+    if (g->cfg.compact_at < 0) g->cfg.compact_at = 0;
     g->api.model = g->cfg.model;
     g->api.max_tokens = g->cfg.max_tokens;
+    g->api.thinking = g->cfg.verbose;
     g->api.system = build_system(g);
     g->api.tools = str_z(TOOLS_JSON);
     if (g->life.failed) { agent_free(g); return 0; }
@@ -176,6 +190,112 @@ void agent_free(agent_t* g) {
     arena_free_all(&g->tmp);
     arena_free_all(&g->ta);
     mem->release(g);
+}
+
+// ---- saving the conversation ----
+
+str_t agent_session_path(const agent_t* g) { return g->sess_path; }
+
+// Another file from here on: "<stem>-N.json", N = parts + 1. The old one keeps what it has.
+static void next_part(agent_t* g) {
+    if (!g->cfg.session.n) return;
+    g->parts++;
+    str_t p = g->cfg.session;
+    if (p.n >= 5 && str_eqz(str_of(p.p + p.n - 5, 5), ".json")) p.n -= 5;
+    sb_t b;
+    sb_init(&b, &g->life);
+    sb_puts(&b, p);
+    sb_putc(&b, '-');
+    sb_putu(&b, (uint64_t)g->parts + 1);
+    sb_putz(&b, ".json");
+    g->sess_path = sb_str(&b);
+}
+
+static void save(agent_t* g) {
+    if (!g->cfg.session.n) return;
+    sb_t b;
+    sb_init(&b, &g->tmp);
+    if (!api_session(&b, g->cfg.model, g->cfg.cwd, &g->tr)) { g->tmp.failed = 1; return; }
+    act_t* a = emit(g, ACT_WRITE);
+    a->id = new_id(g);
+    a->a = g->sess_path;
+    a->b = sb_str(&b);
+    if (g->nsaves == SAVES_MAX) {   // forget the oldest: its answer is then ignored
+        memmove(g->saves, g->saves + 1, (SAVES_MAX - 1) * sizeof g->saves[0]);
+        g->nsaves--;
+    }
+    g->saves[g->nsaves++] = a->id;
+}
+
+// 1 if `id` is a save in flight; it is forgotten then.
+static int take_save(agent_t* g, int64_t id) {
+    for (int i = 0; i < g->nsaves; i++) {
+        if (g->saves[i] != id) continue;
+        memmove(g->saves + i, g->saves + i + 1, (size_t)(g->nsaves - i - 1) * sizeof g->saves[0]);
+        g->nsaves--;
+        return 1;
+    }
+    return 0;
+}
+
+static void on_saved(agent_t* g, const ev_t* ev) {
+    if (ev->status == FS_OK || g->save_warned) return;
+    g->save_warned = 1;
+    sb_t b;
+    sb_init(&b, &g->tmp);
+    sb_putz(&b, "Could not save the conversation to ");
+    sb_puts(&b, g->sess_path);
+    if (ev->note.n) { sb_putz(&b, ": "); sb_puts(&b, ev->note); }
+    sb_putz(&b, ". Barb tries again after each reply.");
+    say(g, SAY_ERROR, sb_str(&b));
+}
+
+// ---- showing the model's thinking, and a resumed conversation ----
+
+// With verbose on, show a thinking block (a raw block of type thinking or redacted_thinking).
+static void say_thinking(agent_t* g, str_t raw) {
+    if (!g->cfg.verbose) return;
+    str_t v, kind, t;
+    if (!json_get(raw, "type", &v) || !json_as_str(&g->tmp, v, &kind)) return;
+    if (str_eqz(kind, "thinking")) {
+        if (json_get(raw, "thinking", &v) && json_as_str(&g->tmp, v, &t)) {
+            t = str_trim(t);
+            if (t.n) say(g, SAY_THINKING, t);
+        }
+    } else if (str_eqz(kind, "redacted_thinking")) {
+        sayz(g, SAY_THINKING, "[redacted thinking]");
+    }
+}
+
+// Show the last REPLAY_MSGS messages again: what the user said, the replies, and a line for each
+// tool call, as they looked when they happened.
+static void replay(agent_t* g) {
+    size_t n = tr_count(&g->tr), from = n > REPLAY_MSGS ? n - REPLAY_MSGS : 0;
+    if (from) {
+        sb_t b;
+        sb_init(&b, &g->tmp);
+        sb_putz(&b, "(");
+        sb_putu(&b, from);
+        sb_putz(&b, " earlier messages not shown)");
+        say(g, SAY_INFO, sb_str(&b));
+    }
+    size_t i = 0;
+    for (const msg_t* m = g->tr.first; m; m = m->next, i++) {
+        if (i < from) continue;
+        for (const block_t* b = m->first; b; b = b->next) {
+            switch (b->kind) {
+            case BK_TEXT:
+                if (m->assistant) say(g, SAY_ASSISTANT, b->text);
+                else if (str_starts(b->text, str_z(COMPACT_MARK)))
+                    sayz(g, SAY_INFO, "(the earlier part of this conversation was compacted into a summary)");
+                else if (!str_starts(b->text, str_z("[barb]"))) say(g, SAY_USER, b->text);
+                break;
+            case BK_TOOL_USE: say(g, SAY_TOOL, tool_label(&g->tmp, b->name, b->input)); break;
+            case BK_RAW: say_thinking(g, b->text); break;
+            case BK_TOOL_RESULT: break;
+            }
+        }
+    }
 }
 
 // ---- asking the model ----
@@ -195,6 +315,8 @@ static void post_request(agent_t* g) {
     g->state = S_MODEL;
 }
 
+static int begin_compact(agent_t* g, why_t why, str_t focus);
+
 static void send_request(agent_t* g) {
     if (g->turns >= g->cfg.max_turns) {
         if (!g->limit_said) {
@@ -212,7 +334,207 @@ static void send_request(agent_t* g) {
     g->turns++;
     g->retries = 0;
     g->wait_said = 0;
+    save(g);
+    int64_t at = g->cfg.compact_at;
+    if (at > 0 && !g->auto_paused && g->ctx_tokens >= at && begin_compact(g, WHY_AUTO, str_of(0, 0)))
+        return;  // the request goes out once the conversation is compacted
     post_request(g);
+}
+
+// ---- compaction (see compact.h) ----
+
+static void send_compact(agent_t* g) {
+    act_t* a = emit(g, ACT_HTTP);
+    a->id = g->http_id = new_id(g);
+    a->a = str_z("/v1/messages");
+    a->b = g->cp.body;
+    g->state = S_COMPACT;
+}
+
+// Start compacting; 0 if there is nothing to compact (the conversation is no more than the
+// user's newest words).
+static int begin_compact(agent_t* g, why_t why, str_t focus) {
+    // The text at the end of the last user message has not been answered yet: it is in the
+    // summary request, and it follows the summary verbatim too, so nothing the user just said is
+    // left to a paraphrase.
+    const block_t* held = 0;
+    size_t nheld = 0, nblocks = 0;
+    msg_t* last = g->tr.last;
+    if (last && !last->assistant) {
+        for (const block_t* b = last->first; b; b = b->next) {
+            nblocks++;
+            if (b->kind != BK_TEXT) { held = 0; nheld = 0; }
+            else { if (!held) held = b; nheld++; }
+        }
+    }
+    int only_held = g->tr.first == last && last && !last->assistant && nheld == nblocks;
+    if (!g->tr.first || only_held) return 0;
+
+    sb_t b;
+    sb_init(&b, &g->tmp);
+    if (why == WHY_AUTO) {
+        sb_putz(&b, "(compacting the conversation: it takes ");
+        sb_puti(&b, g->ctx_tokens);
+        sb_putz(&b, " tokens, past the ");
+        sb_puti(&b, g->cfg.compact_at);
+        sb_putz(&b, " set for it)");
+    } else if (why == WHY_MANUAL) {
+        sb_putz(&b, "(compacting the conversation)");
+    } else {
+        sb_putz(&b, "(the conversation no longer fits the model's context window: compacting it)");
+    }
+    say(g, SAY_INFO, sb_str(&b));
+
+    // After an overflow the conversation as it is does not fit either: send less of it.
+    transcript_t tr;
+    int ok = why == WHY_OVERFLOW ? compact_trimmed(&g->tmp, &g->tr, &tr) : tr_copy(&g->tmp, &g->tr, &tr);
+    msg_t* u = ok ? tr_user_msg(&g->tmp, &tr) : 0;
+    if (!u || !tr_add_text(&g->tmp, u, compact_instruction(&g->tmp, focus))) { g->tmp.failed = 1; return 1; }
+    sb_t body;
+    sb_init(&body, &g->tmp);
+    if (!api_request(&body, &g->api, &tr)) { g->tmp.failed = 1; return 1; }
+
+    memset(&g->cp, 0, sizeof g->cp);
+    g->cp.on = 1;
+    g->cp.why = why;
+    g->cp.body = str_dup(&g->life, sb_str(&body));
+    block_t** tail = &g->cp.held;
+    for (const block_t* h = held; h; h = h->next) {
+        block_t* c = block_new(&g->life, BK_TEXT);
+        if (!c) return 1;
+        *c = *h;
+        c->next = 0;
+        *tail = c;
+        tail = &c->next;
+    }
+    g->retries = 0;
+    send_compact(g);
+    return 1;
+}
+
+// The summary request failed (`reason` says how); the conversation stays as it was.
+static void compact_failed(agent_t* g, str_t reason) {
+    why_t why = g->cp.why;
+    g->cp.on = 0;
+    g->state = S_IDLE;
+    sb_t b;
+    sb_init(&b, &g->tmp);
+    sb_putz(&b, "Could not compact the conversation: ");
+    sb_puts(&b, reason);
+    if (why == WHY_MANUAL) {
+        sb_putz(&b, "\nIt is unchanged.");
+        say(g, SAY_ERROR, sb_str(&b));
+    } else if (why == WHY_AUTO) {
+        // Do not try again on every request: each try costs a request.
+        g->auto_paused = 1;
+        sb_putz(&b, "\nGoing on without it; automatic compaction is paused until /compact works.");
+        say(g, SAY_ERROR, sb_str(&b));
+        post_request(g);
+    } else {
+        sb_putz(&b, "\nThe conversation no longer fits the model's context window. /clear starts over.");
+        say(g, SAY_ERROR, sb_str(&b));
+        g->failed = 1;
+    }
+}
+
+// The summary came: it takes the conversation's place.
+static void compact_done(agent_t* g, const api_reply_t* r) {
+    sb_t rb;
+    sb_init(&rb, &g->tmp);
+    for (const block_t* b = r->msg->first; b; b = b->next)
+        if (b->kind == BK_TEXT) { sb_puts(&rb, b->text); sb_putc(&rb, '\n'); }
+    str_t summary = compact_extract(&g->tmp, sb_str(&rb));
+    int cut = str_eqz(r->stop_reason, "max_tokens");
+    if (!summary.n) {
+        compact_failed(g, str_z(cut ? "the summary was cut off at the output token limit" : "the model wrote no summary"));
+        return;
+    }
+    compact_t cp = g->cp;
+    g->cp.on = 0;
+    {
+        sb_t b;
+        sb_init(&b, &g->tmp);
+        sb_putz(&b, "[tokens: ");
+        sb_puti(&b, r->in_tok + r->cache_read + r->cache_write);
+        sb_putz(&b, " in, ");
+        sb_puti(&b, r->out_tok);
+        sb_putz(&b, " out, for the summary]");
+        act_t* a = emit_op(g, ACT_SAY, sb_str(&b), str_of(0, 0), str_of(0, 0));
+        a->flag = SAY_USAGE;
+        a->n = r->out_tok;
+    }
+    g->ctx_tokens = r->out_tok;  // what the conversation takes now: about the summary's length
+    if (g->cfg.verbose) say(g, SAY_THINKING, summary);
+    size_t n = tr_count(&g->tr);
+    str_t old = g->sess_path;
+    next_part(g);  // the whole conversation stays in the file it was in
+
+    g->tr.first = g->tr.last = 0;
+    msg_t* m = tr_new_msg(&g->life, &g->tr, 0);
+    if (m) {
+        tr_add_text(&g->life, m, compact_summary_message(&g->life, summary));
+        for (block_t* h = cp.held; h;) { block_t* next = h->next; msg_add(m, h); h = next; }
+    }
+    g->auto_paused = 0;
+    g->state = S_IDLE;
+    save(g);
+
+    sb_t b;
+    sb_init(&b, &g->tmp);
+    sb_putz(&b, "(compacted: ");
+    sb_putu(&b, n);
+    sb_putz(&b, " messages became a summary");
+    if (g->cfg.session.n) { sb_putz(&b, "; the whole conversation is still in "); sb_puts(&b, old); }
+    sb_putc(&b, ')');
+    say(g, SAY_INFO, sb_str(&b));
+    if (cut) sayz(g, SAY_INFO, "(the summary was cut off at the output token limit: it may leave out the latest work)");
+    if (cp.why != WHY_MANUAL) post_request(g);
+}
+
+// The user stopped a compaction: the conversation stays as it was.
+static void stop_compact(agent_t* g, int64_t op) {
+    emit(g, ACT_CANCEL)->id = op;
+    g->http_id = 0;
+    g->state = S_IDLE;
+    why_t why = g->cp.why;
+    g->cp.on = 0;
+    if (why != WHY_MANUAL) {
+        // A request was waiting on it, as if it had gone to the model: say so, as then.
+        msg_t* u = tr_user_msg(&g->life, &g->tr);
+        if (u) tr_add_text(&g->life, u, str_z(INTERRUPTED_NOTE));
+        save(g);
+    }
+    sayz(g, SAY_INFO, "Interrupted; the conversation was not compacted.");
+}
+
+static void compact_command(agent_t* g, str_t focus) {
+    if (g->state != S_IDLE) sayz(g, SAY_ERROR, "Busy: wait for the current step, or press Ctrl-C, before /compact.");
+    else if (!begin_compact(g, WHY_MANUAL, focus)) sayz(g, SAY_INFO, "Nothing to compact yet.");
+}
+
+static void compact_setting(agent_t* g, str_t arg) {
+    int64_t n = parse_compact_at(arg);
+    sb_t b;
+    sb_init(&b, &g->tmp);
+    if (n == 0) {
+        g->cfg.compact_at = 0;
+        sb_putz(&b, "Automatic compaction is off. /compact still compacts when you ask; /compact at N turns it back on.");
+    } else if (n > 0) {
+        g->cfg.compact_at = n;
+        g->auto_paused = 0;
+        sb_putz(&b, "Compaction: automatic once the conversation takes ");
+        sb_puti(&b, n);
+        sb_putz(&b, " tokens.");
+    } else {
+        sb_putz(&b, "Unknown size ");
+        sb_puts(&b, arg);
+        sb_putz(&b, ". " COMPACT_HELP " The smallest is ");
+        sb_putu(&b, MIN_COMPACT_AT);
+        sb_putc(&b, '.');
+        say(g, SAY_ERROR, sb_str(&b));
+        return;
+    }
+    say(g, SAY_INFO, sb_str(&b));
 }
 
 // ---- the project's instructions ----
@@ -446,26 +768,22 @@ static void run_calls(agent_t* g) {
 
 // ---- the model's reply ----
 
-static void say_api_error(agent_t* g, int status, const api_reply_t* r, int parsed, str_t body) {
-    sb_t b;
-    sb_init(&b, &g->tmp);
-    sb_putz(&b, "API error (HTTP ");
-    sb_puti(&b, status);
-    if (parsed && r->err_type.n) { sb_putz(&b, ", "); sb_puts(&b, r->err_type); }
-    sb_putz(&b, ")");
-    if (parsed && r->err_msg.n) { sb_putz(&b, ": "); sb_puts(&b, r->err_msg); }
+// What to tell the user about an API error. `parsed`: r holds an error object from the API.
+static void api_error(sb_t* b, int status, const api_reply_t* r, int parsed, str_t body) {
+    sb_putz(b, "API error (HTTP ");
+    sb_puti(b, status);
+    if (parsed && r->err_type.n) { sb_putz(b, ", "); sb_puts(b, r->err_type); }
+    sb_putz(b, ")");
+    if (parsed && r->err_msg.n) { sb_putz(b, ": "); sb_puts(b, r->err_msg); }
     else if (!parsed) {
-        sb_putz(&b, ": unreadable reply: ");
-        sb_put(&b, body.p, body.n > 300 ? 300 : body.n);
+        sb_putz(b, ": unreadable reply: ");
+        sb_put(b, body.p, body.n > 300 ? 300 : body.n);
     }
-    if (status == 401 || status == 403) sb_putz(&b, "\nCheck ANTHROPIC_API_KEY.");
-    if (parsed && str_find(r->err_msg, str_z("too long")) != STR_NONE)
-        sb_putz(&b, "\nThe conversation no longer fits the model's context window. Use /clear to start over.");
-    say(g, SAY_ERROR, sb_str(&b));
+    if (status == 401 || status == 403) sb_putz(b, "\nCheck ANTHROPIC_API_KEY.");
 }
 
 static void on_http(agent_t* g, const ev_t* ev) {
-    if (g->state != S_MODEL || ev->id != g->http_id) return;  // stale: we cancelled it
+    if ((g->state != S_MODEL && g->state != S_COMPACT) || ev->id != g->http_id) return;  // stale: we cancelled it
     g->http_id = 0;
     int st = ev->status;
 
@@ -496,6 +814,7 @@ static void on_http(agent_t* g, const ev_t* ev) {
             sb_init(&b, &g->tmp);
             sb_putz(&b, "The request failed and retrying did not help");
             if (ev->note.n) { sb_putz(&b, ": "); sb_puts(&b, ev->note); }
+            if (g->cp.on) { compact_failed(g, sb_str(&b)); return; }
             say(g, SAY_ERROR, sb_str(&b));
             g->state = S_IDLE;
             g->failed = 1;
@@ -504,13 +823,29 @@ static void on_http(agent_t* g, const ev_t* ev) {
     }
 
     api_reply_t r;
-    int parsed = api_parse(&g->life, ev->data, &r);
+    // A summary is read and dropped; a reply joins the conversation.
+    int parsed = api_parse(g->cp.on ? &g->tmp : &g->life, ev->data, &r);
     if (st != 200 || !parsed || !r.is_message) {
-        say_api_error(g, st, &r, parsed && !r.is_message, ev->data);
+        int err = parsed && !r.is_message;
+        sb_t b;
+        sb_init(&b, &g->tmp);
+        api_error(&b, st, &r, err, ev->data);
+        if (g->cp.on) { compact_failed(g, sb_str(&b)); return; }
+        int overflow = err && is_overflow(r.err_msg);
+        // Once: a compacted conversation is one message of text, which is not compacted again.
+        if (overflow && g->cfg.compact_at > 0 && begin_compact(g, WHY_OVERFLOW, str_of(0, 0)))
+            return;  // the request goes out again once the conversation is compacted
+        if (overflow && tr_count(&g->tr) > 1)
+            sb_putz(&b, "\nThe conversation no longer fits the model's context window. "
+                        "/compact summarizes it to make room; /clear starts over.");
+        else if (overflow)  // nothing before it to compact (or that was done already): the newest message does not fit
+            sb_putz(&b, "\nThe message does not fit the model's context window: send less at a time.");
+        say(g, SAY_ERROR, sb_str(&b));
         g->state = S_IDLE;
         g->failed = 1;
         return;
     }
+    if (g->cp.on) { compact_done(g, &r); return; }
     g->retries = 0;
     g->failed = 0;
 
@@ -518,6 +853,7 @@ static void on_http(agent_t* g, const ev_t* ev) {
     int ncalls = 0;
     for (block_t* b = m->first; b; b = b->next) {
         if (b->kind == BK_TEXT) say(g, SAY_ASSISTANT, b->text);
+        if (b->kind == BK_RAW) say_thinking(g, b->text);
         if (b->kind == BK_TOOL_USE) ncalls++;
     }
     {
@@ -532,12 +868,13 @@ static void on_http(agent_t* g, const ev_t* ev) {
         sb_putz(&b, " out]");
         act_t* a = emit_op(g, ACT_SAY, sb_str(&b), str_of(0, 0), str_of(0, 0));
         a->flag = SAY_USAGE;
-        a->n = r.in_tok + r.cache_read + r.cache_write + r.out_tok;
+        a->n = g->ctx_tokens = r.in_tok + r.cache_read + r.cache_write + r.out_tok;
     }
     if (m->first) {
         m->next = 0;
         if (g->tr.last) g->tr.last->next = m; else g->tr.first = m;
         g->tr.last = m;
+        save(g);
     }
 
     if (ncalls == 0) {
@@ -573,28 +910,80 @@ static void on_http(agent_t* g, const ev_t* ev) {
 
 // ---- user input and commands ----
 
+// The first word of a command line, and the rest, trimmed.
+static void split_command(str_t line, str_t* word, str_t* arg) {
+    size_t i = 0;
+    while (i < line.n && line.p[i] != ' ' && line.p[i] != '\t') i++;
+    *word = str_of(line.p, i);
+    *arg = str_trim(str_of(line.p + i, line.n - i));
+}
+
+// What the prompt takes as a command, whatever follows it.
+static const char* const COMMANDS[] = { "/exit", "/quit", "/clear", "/help", "/verbose", "/compact" };
+
 static int is_command(str_t line) {
     if (line.n == 0 || line.p[0] != '/') return 0;
-    if (str_starts(line, str_z("/exit")) || str_starts(line, str_z("/quit")) ||
-        str_starts(line, str_z("/clear")) || str_starts(line, str_z("/help"))) return 1;
-    for (size_t i = 0; i < line.n; i++) if (line.p[i] == ' ' || line.p[i] == '\t') return 0;  // a prompt that mentions a path
-    return 1;  // one word starting with /: a mistyped command
+    str_t word, arg;
+    split_command(line, &word, &arg);
+    for (size_t i = 0; i < sizeof COMMANDS / sizeof COMMANDS[0]; i++) if (str_eqz(word, COMMANDS[i])) return 1;
+    return word.n == line.n;  // one word starting with /: a mistyped command. With a space: a prompt that mentions a path.
+}
+
+static void compact_status(agent_t* g) {
+    sb_t b;
+    sb_init(&b, &g->tmp);
+    if (g->cfg.compact_at > 0) {
+        sb_putz(&b, "Compaction: automatic once the conversation takes ");
+        sb_puti(&b, g->cfg.compact_at);
+        sb_putz(&b, " tokens");
+        if (g->auto_paused) sb_putz(&b, " (paused: the last try failed)");
+    } else {
+        sb_putz(&b, "Compaction: automatic compaction is off");
+    }
+    if (g->ctx_tokens > 0) {
+        sb_putz(&b, "; the conversation takes about ");
+        sb_puti(&b, g->ctx_tokens);
+        sb_putz(&b, " now");
+    }
+    sb_putz(&b, ". " COMPACT_HELP);
+    say(g, SAY_INFO, sb_str(&b));
 }
 
 static void run_command(agent_t* g, str_t line) {
-    if (str_eqz(line, "/exit") || str_eqz(line, "/quit")) {
+    str_t word, arg;
+    split_command(line, &word, &arg);
+    if (str_eqz(word, "/compact")) {
+        if (str_eqz(arg, "at")) compact_status(g);
+        else if (str_eqz(arg, "off")) compact_setting(g, arg);
+        else if (str_starts(arg, str_z("at ")) || str_starts(arg, str_z("at\t")))
+            compact_setting(g, str_trim(str_of(arg.p + 3, arg.n - 3)));
+        else compact_command(g, arg);
+    } else if ((str_eqz(word, "/exit") || str_eqz(word, "/quit")) && !arg.n) {
         act_t* a = emit(g, ACT_DONE);
         a->n = 0;
         g->done = 1;
-    } else if (str_eqz(line, "/clear")) {
+    } else if (str_eqz(word, "/clear") && !arg.n) {
         if (g->state != S_IDLE) { sayz(g, SAY_ERROR, "Busy: wait for the current step, or press Ctrl-C, before /clear."); return; }
+        if (g->tr.first) next_part(g);  // the old conversation stays in its file
         g->tr.first = g->tr.last = 0;
         g->nhead = g->ntail = 0;
         g->nseen = 0;
+        g->resume_note = str_of(0, 0);
         g->turns = 0;
+        g->ctx_tokens = 0;
         sayz(g, SAY_INFO, "Conversation cleared. Background tasks and timers are still running.");
-    } else if (str_eqz(line, "/help")) {
-        sayz(g, SAY_INFO, "/clear  forget the conversation\n/exit   quit (also Ctrl-D)\nCtrl-C  stop what is running; twice at the prompt to quit");
+    } else if (str_eqz(word, "/verbose") && !arg.n) {
+        g->cfg.verbose = !g->cfg.verbose;
+        g->api.thinking = g->cfg.verbose;  // turning it on or off costs one cache miss
+        sayz(g, SAY_INFO, g->cfg.verbose ? "Verbose: the model's thinking is shown." : "Verbose off: thinking is hidden.");
+    } else if (str_eqz(word, "/help") && !arg.n) {
+        sayz(g, SAY_INFO,
+            "/clear           forget the conversation (a saved one stays saved)\n"
+            "/verbose         show or hide the model's thinking\n"
+            "/compact [FOCUS] summarize the conversation to make room (FOCUS: what to keep in view)\n"
+            "/compact at [N]  show or set when that happens by itself (a token count); /compact off\n"
+            "/exit            quit (also Ctrl-D)\n"
+            "Ctrl-C           stop what is running; twice at the prompt to quit");
     } else {
         sb_t b;
         sb_init(&b, &g->tmp);
@@ -622,8 +1011,12 @@ static void on_input(agent_t* g, str_t line) {
 
 static void on_interrupt(agent_t* g) {
     switch (g->state) {
+    case S_COMPACT:
+        stop_compact(g, g->http_id);
+        break;
     case S_MODEL:
     case S_RETRY: {
+        if (g->cp.on) { stop_compact(g, g->retry_timer); break; }  // waiting to retry a summary request
         act_t* a = emit(g, ACT_CANCEL);
         a->id = g->state == S_MODEL ? g->http_id : g->retry_timer;
         g->http_id = 0;
@@ -632,7 +1025,8 @@ static void on_interrupt(agent_t* g) {
         // types next joins it. Say what happened, or the model takes up the old request as if
         // nothing had.
         msg_t* u = tr_user_msg(&g->life, &g->tr);
-        if (u) tr_add_text(&g->life, u, str_z("[barb] The user interrupted you here, before you replied."));
+        if (u) tr_add_text(&g->life, u, str_z(INTERRUPTED_NOTE));
+        save(g);
         sayz(g, SAY_INFO, "Interrupted.");
         break;
     }
@@ -658,6 +1052,7 @@ static void on_interrupt(agent_t* g) {
         }
         arena_free_all(&g->ta);
         complete_round(g, 0);
+        save(g);
         sayz(g, SAY_INFO, "Interrupted.");
         break;
     }
@@ -711,7 +1106,7 @@ static void on_proc(agent_t* g, const ev_t* ev) {
 
 static void on_timer(agent_t* g, const ev_t* ev) {
     if (g->state == S_RETRY && ev->id == g->retry_timer) {
-        post_request(g);
+        if (g->cp.on) send_compact(g); else post_request(g);
         return;
     }
     for (wake_t** p = &g->wakes; *p; p = &(*p)->next) {
@@ -764,10 +1159,56 @@ static void settle(agent_t* g) {
 
 // ---- the entry point ----
 
-const act_t* agent_step(agent_t* g, const ev_t* ev, size_t* n) {
+static void begin_step(agent_t* g) {
     arena_free_all(&g->tmp);
     g->acts = 0;
     g->nacts = g->cap = 0;
+}
+
+static const act_t* end_step(agent_t* g, size_t* n) {
+    if (g->life.failed || g->tmp.failed || g->ta.failed) {
+        // Memory ran out somewhere; the state may be half built. Say so and stop rather than go on.
+        static act_t fatal[2];
+        memset(fatal, 0, sizeof fatal);
+        fatal[0].kind = ACT_SAY; fatal[0].flag = SAY_ERROR; fatal[0].a = str_z("Out of memory. Exiting.");
+        fatal[1].kind = ACT_DONE; fatal[1].n = 1;
+        *n = 2;
+        g->done = 1;
+        return fatal;
+    }
+    *n = g->nacts;
+    return g->acts;
+}
+
+int agent_resume(agent_t* g, str_t data, int show, const act_t** acts, size_t* n) {
+    begin_step(g);
+    session_t s;
+    if (!api_load_session(&g->life, data, &s)) {
+        if (!g->life.failed) { *acts = 0; *n = 0; return 0; }
+        *acts = end_step(g, n);
+        return 1;
+    }
+    g->tr = s.tr;
+    if (show) replay(g);
+    sb_t b;
+    sb_init(&b, &g->life);
+    sb_putz(&b, "[barb] This conversation was saved and is being resumed now. Files may have changed since, "
+                "so read a file again before you edit it.");
+    if (s.cwd.n && !str_eq(s.cwd, g->cfg.cwd)) {
+        sb_putz(&b, " It was saved in "); sb_puts(&b, s.cwd);
+        sb_putz(&b, "; the working directory is now "); sb_puts(&b, g->cfg.cwd); sb_putc(&b, '.');
+        sb_t t;
+        sb_init(&t, &g->tmp);
+        sb_putz(&t, "(this conversation was saved in "); sb_puts(&t, s.cwd); sb_putc(&t, ')');
+        say(g, SAY_INFO, sb_str(&t));
+    }
+    g->resume_note = sb_str(&b);
+    *acts = end_step(g, n);
+    return 1;
+}
+
+const act_t* agent_step(agent_t* g, const ev_t* ev, size_t* n) {
+    begin_step(g);
 
     if (!g->done) {
         switch (ev->kind) {
@@ -775,6 +1216,7 @@ const act_t* agent_step(agent_t* g, const ev_t* ev, size_t* n) {
         case EV_EOF: g->eof = 1; break;
         case EV_HTTP: on_http(g, ev); break;
         case EV_FILE:
+            if (take_save(g, ev->id)) { on_saved(g, ev); break; }
             if (g->state == S_LOAD && g->ld_op && ev->id == g->ld_op) { on_load(g, ev); break; }
             // fall through
         case EV_ANSWER:
@@ -789,19 +1231,7 @@ const act_t* agent_step(agent_t* g, const ev_t* ev, size_t* n) {
         }
         settle(g);
     }
-
-    if (g->life.failed || g->tmp.failed || g->ta.failed) {
-        // Memory ran out somewhere; the state may be half built. Say so and stop rather than go on.
-        static act_t fatal[2];
-        memset(fatal, 0, sizeof fatal);
-        fatal[0].kind = ACT_SAY; fatal[0].flag = SAY_ERROR; fatal[0].a = str_z("Out of memory. Exiting.");
-        fatal[1].kind = ACT_DONE; fatal[1].n = 1;
-        *n = 2;
-        g->done = 1;
-        return fatal;
-    }
-    *n = g->nacts;
-    return g->acts;
+    return end_step(g, n);
 }
 
 int agent_busy(const agent_t* g) { return !g->done && g->state != S_IDLE; }

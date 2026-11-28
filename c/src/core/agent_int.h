@@ -5,7 +5,26 @@
 #include "agent.h"
 #include "api.h"
 
-typedef enum { S_IDLE, S_MODEL, S_RETRY, S_TOOLS, S_LOAD } gstate_t;
+typedef enum {
+    S_IDLE, S_MODEL, S_RETRY, S_TOOLS, S_LOAD,
+    S_COMPACT          // the summary request of a compaction is in flight
+} gstate_t;
+
+// Why a compaction is under way.
+typedef enum {
+    WHY_AUTO,          // the conversation passed compact_at; the request it held back goes out after
+    WHY_MANUAL,        // /compact
+    WHY_OVERFLOW       // the API said the request no longer fits; it goes out again after
+} why_t;
+
+typedef struct {
+    int on;
+    why_t why;
+    str_t body;        // the summary request, kept for retries
+    block_t* held;     // the user's newest words, not yet answered: they follow the summary verbatim
+} compact_t;
+
+#define SAVES_MAX 16
 
 typedef struct {
     str_t id, name, input;
@@ -86,6 +105,17 @@ struct agent {
     int done;
     int failed;            // the last model call ended in an API error (the exit status when we finish)
 
+    int64_t saves[SAVES_MAX]; // saves in flight (the oldest is forgotten when there are more)
+    int nsaves;
+    int save_warned;       // a failed save has been reported
+    int parts;             // how many times /clear or a compaction has started a new file
+    str_t sess_path;       // the file it is saved to now
+    str_t resume_note;     // said to the model at the start of the next user message, after a resume
+
+    compact_t cp;          // the compaction under way
+    int64_t ctx_tokens;    // what the conversation took at the last reply, in tokens (0: not known yet)
+    int auto_paused;       // an automatic compaction failed: no more until /compact works or the setting changes
+
     act_t* acts;
     size_t nacts, cap;
 };
@@ -104,7 +134,9 @@ void seen_add(agent_t* g, str_t path);
 extern const char TOOLS_JSON[];
 void tool_begin(agent_t* g, call_t* c);
 void tool_event(agent_t* g, call_t* c, const ev_t* ev);
-// A running background task or timer count, for the "waiting" line.
+// `s` cut to about `max` bytes by taking out its middle, with a note saying so.
 str_t cap_output(arena_t* a, str_t s, size_t max);
+// A tool call in a line, as it is shown when it runs: "read_file src/a.c", "bash run the tests".
+str_t tool_label(arena_t* a, str_t name, str_t input);
 
 #endif

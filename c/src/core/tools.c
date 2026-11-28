@@ -95,6 +95,27 @@ static str_t first_line(str_t s, size_t max) {
     return str_of(s.p, n);
 }
 
+str_t tool_label(arena_t* a, str_t name, str_t input) {
+    sb_t b;
+    sb_init(&b, a);
+    sb_puts(&b, name);
+    str_t v, s = str_of(0, 0);
+    if (str_eqz(name, "read_file") || str_eqz(name, "edit_file") || str_eqz(name, "write_file")) {
+        if (json_get(input, "path", &v)) json_as_str(a, v, &s);
+        sb_putc(&b, ' ');
+        sb_puts(&b, s);
+    } else if (str_eqz(name, "bash")) {
+        int bg = 0;
+        str_t desc = str_of(0, 0), cmd = str_of(0, 0);
+        if (json_get(input, "run_in_background", &v)) json_as_bool(v, &bg);
+        if (json_get(input, "description", &v)) json_as_str(a, v, &desc);
+        if (json_get(input, "command", &v)) json_as_str(a, v, &cmd);
+        sb_putz(&b, bg ? " (background) " : " ");
+        sb_puts(&b, desc.n ? desc : first_line(cmd, 100));
+    }
+    return sb_str(&b);
+}
+
 // The input must be a JSON object; then each argument is looked up by name.
 static int input_ok(agent_t* g, call_t* c) {
     str_t in = str_trim(c->input);

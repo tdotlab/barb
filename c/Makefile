@@ -9,7 +9,7 @@ CFLAGS ?= -O2
 WARN = -std=gnu11 -Wall -Wextra -Werror
 SAN = -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all
 
-CORE = src/core/arena.c src/core/str.c src/core/json.c src/core/api.c src/core/agent.c src/core/tools.c
+CORE = src/core/arena.c src/core/str.c src/core/json.c src/core/api.c src/core/agent.c src/core/tools.c src/core/compact.c
 UI = src/ui/edit.c src/ui/keys.c src/ui/md.c src/ui/screen.c
 POSIX = src/posix/ops.c src/posix/main.c
 HEADERS = $(wildcard src/core/*.h src/ui/*.h src/posix/*.h)

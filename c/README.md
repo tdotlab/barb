@@ -28,23 +28,47 @@ build/barb -p "fix the failing test in tests/foo.c" --yes
 
 Options: `-p TASK` (do one task and exit; `-` reads it from standard input), `-m MODEL` (default
 `claude-sonnet-5-5`, or `$BARB_MODEL`), `-y/--yes` (do not ask before writing files or running
-commands), `-C DIR`, `--max-turns N` (model calls per message without you typing; default 60).
+commands), `-C DIR`, `--max-turns N` (model calls per message without you typing; default 60),
+`-c`, `-r NAME`, `--sessions`, `--no-save` (below), `-v/--verbose` (show the model's thinking) and
+`--compact-at N`.
 `ANTHROPIC_BASE_URL` points it at another endpoint (the tests use a fake one on localhost).
 DeepSeek works through its Anthropic-compatible route: `ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic`
 with `-m deepseek-flash` (checked live: tools, caching, thinking blocks and background wake-ups all behave).
 OpenRouter works too: `ANTHROPIC_BASE_URL=https://openrouter.ai/api` with an OpenRouter key and a model
 like `-m deepseek/deepseek-chat` (it accepts the `x-api-key` header Barb sends; checked live).
 
-In a session, `/clear` forgets the conversation, `/exit` or Ctrl-D quits, and Ctrl-C stops what
-is running (twice at the prompt quits); the model is told it was interrupted. Type while it works
-and your message is queued.
+In a session, `/clear` forgets the conversation, `/verbose` shows or hides the model's thinking,
+`/compact` is below, `/help` lists them, `/exit` or Ctrl-D quits, and Ctrl-C stops what is running
+(twice at the prompt quits); the model is told it was interrupted. Type while it works and your
+message is queued.
+
+## Saved conversations
+
+The conversation is saved as it goes, one file each in `.barb/sessions` in the working directory.
+`barb -c` takes up the newest one there, `barb -r NAME` a named one (or a path), and
+`barb --sessions` lists them. On a terminal the last 40 messages are shown again, and the model is
+told that files may have changed since. The saved model is used unless `-m` or `BARB_MODEL` names
+one. `/clear` and compaction go on in a new file (`NAME-2`), so nothing saved is overwritten.
+`--no-save` writes nothing. Barb puts a `.gitignore` in `.barb/`. The format is in
+`../docs/SESSIONS.md`, and is the Rust version's, so either can take up the other's.
+
+## Compaction
+
+When the conversation passes a size, Barb asks the model to summarize it, and the summary takes its
+place. The point is 150k tokens unless `--compact-at N` or `BARB_COMPACT_AT` says otherwise (`200000`,
+`200k`, `1m`, or `off`; at least 1000). `/compact` does it now, and `/compact FOCUS` says what the
+summary should keep in view; `/compact at N` shows or changes the point, and `/compact off` stops
+the automatic ones. If a request no longer fits the model's context window, Barb compacts and sends
+it again, once, with long tool results cut for the summary request. A failed automatic compaction
+leaves the conversation as it was and pauses automatic ones until `/compact` works or the setting
+changes. The point is one number for every model, so set it lower for a small one.
 
 On a terminal the prompt sits in a small block at the bottom: a line above it says what is going
 on (a spinner while the model thinks or a command runs, with the seconds; the retry countdown after
 a failed request; the background tasks and wakeups it is idle on), a rule, the prompt, and a footer
 with the model, the directory, the tokens the conversation takes, and a hint for the key that
 matters now. The record scrolls above it: each tool call a line with its name in bold and its
-result hung under it, errors in red, questions with a diff's added and removed lines coloured. Replies
+result hung under it, errors in red, thinking (when verbose) dim and italic, questions with a diff's added and removed lines coloured. Replies
 are rendered from markdown: headings, bold, italics, code, links, lists, quotes, fenced code, rules,
 and tables (aligned, or a record per row when too wide), wrapped at words. Text from the model or a
 command is never sent to the terminal raw: its control characters are shown as `^[` and the like.
@@ -128,14 +152,19 @@ shell), the same sleeping on background tasks, the same keys. HTTP goes through 
 in its arguments. RingTail's shell holds 255 characters a line, so a long task goes in a file:
 `barb -p - < task.txt`. Its tests are in RingTail's QEMU suite (`barb_tests` in `qemu_test.py`).
 
+It saves no conversations there yet. Compaction is on at 150k (`/compact at N` changes it), but
+neither it nor `/verbose` has been tried on RingTail.
+
 ## Tests
 
 `make test` runs, under the address and undefined-behaviour sanitizers (gcc):
 
 - `test_core`: arena, strings, JSON (valid and invalid corpus, UTF-8 edge cases, nesting limit,
   40,000 fuzz mutations);
-- `test_api`: the request body and reply parsing, including every allocation failing;
-- `test_agent`: scenarios for every tool and error path, interrupts in every state, a randomized
+- `test_api`: the request body and reply parsing, saved conversations (writing, loading, repairing
+  and naming them), including every allocation failing;
+- `test_agent`: scenarios for every tool and error path, saving, resuming, compaction and verbose,
+  interrupts in every state, a randomized
   chaos test of event orders, and out-of-memory at every allocation point of a long scenario. A fake
   model and a fake world run the whole agent, and every request it builds is checked against the
   rules the API enforces (see ARCHITECTURE.md);
@@ -160,14 +189,12 @@ On Windows, `build.cmd test` runs the same under AddressSanitizer, then `tests/e
 time; every mutation in its table is caught. The out-of-memory test refuses allocations two ways,
 every one from a point on and exactly one, and checks that a refusal always ends in a clean
 "Out of memory" stop. It runs with `make` or with `build.cmd`, on whichever system it is on.
-Not tested: macOS, and sessions long enough to fill the context window.
+Not tested: macOS, and compaction against a live model (only the fake one).
 
 ## Limits
 
 - Replies are not streamed: you see the answer when it is complete.
-- No compaction: when the conversation outgrows the model's context window, the API says so and
-  you `/clear`.
-- The conversation is not saved between runs.
+- Compaction keeps nothing of the older conversation word for word; it is still in the file before.
 - A command that is not run in the background is killed, with its children, when it ends or after
   its timeout (default 2 minutes, at most 10). Background tasks are killed when Barb exits.
 - `edit_file` and `write_file` follow symbolic links and write atomically, but do not keep file

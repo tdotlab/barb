@@ -20,6 +20,7 @@
 #include <string.h>
 #include <time.h>
 #include "../core/agent.h"
+#include "../core/compact.h"
 #include "../ui/screen.h"
 #include "ops.h"
 
@@ -415,6 +416,8 @@ static void ask(const act_t* a) {
     awaiting = a->id;
 }
 
+static void wrote(str_t path);
+
 // Every action is shown to the screen first (ACT_SAY is only that), then carried out.
 static void exec(const act_t* a) {
     sc_action(&scr, a, ops_now_ms());
@@ -422,7 +425,7 @@ static void exec(const act_t* a) {
     case ACT_SAY: break;
     case ACT_HTTP: ops_http(a->id, a->a, a->b); break;
     case ACT_READ: ops_read(a->id, a->a); break;
-    case ACT_WRITE: ops_write(a->id, a->a, a->b); break;
+    case ACT_WRITE: ops_write(a->id, a->a, a->b); wrote(a->a); break;
     case ACT_SPAWN: ops_spawn(a->id, a->a, a->n, a->flag, a->c); break;
     case ACT_TIMER: ops_timer(a->id, a->n); break;
     case ACT_CANCEL:
@@ -507,23 +510,229 @@ static void loop(void) {
 // ---- starting up ----
 
 static void usage(int to_err) {
-    char b[1400];
+    char b[2600];
     snprintf(b, sizeof b,
         "barb %s: a coding agent for the terminal\n\n"
         "usage: barb [options]\n"
         "       barb -p TASK [options]\n\n"
         "  -p, --prompt TASK   do one task and exit (TASK of - reads it from standard input)\n"
         "  -m, --model NAME    the model (default %s, or %%BARB_MODEL%%)\n"
+        "      --compact-at N  compact the conversation by itself past N tokens: 200k, or off\n"
+        "                      (default 150k, or %%BARB_COMPACT_AT%%; /compact at N changes it)\n"
         "  -y, --yes           do not ask before writing files or running commands\n"
         "  -C, --cwd DIR       work in DIR\n"
         "      --max-turns N   stop after N model calls without you typing (default 60)\n"
         "      --no-instructions  do not read AGENTS.md or CLAUDE.md from the working directory\n"
+        "  -c, --continue      take up the conversation saved last in this directory\n"
+        "  -r, --resume NAME   take up a saved conversation (--sessions lists them)\n"
+        "      --sessions      list the conversations saved in this directory\n"
+        "      --no-save       do not save this conversation (they go in .barb\\sessions)\n"
+        "  -v, --verbose       show the model's thinking (/verbose switches it)\n"
         "  -V, --version\n"
         "  -h, --help\n\n"
-        "environment: ANTHROPIC_API_KEY (required), ANTHROPIC_BASE_URL, BARB_MODEL,\n"
+        "environment: ANTHROPIC_API_KEY (required), ANTHROPIC_BASE_URL, BARB_MODEL, BARB_COMPACT_AT,\n"
         "             BARB_SHELL (the bash.exe to run commands in; Git for Windows' is found by itself)\n",
         VERSION, DEFAULT_MODEL);
     if (to_err) errz(b); else out(b, strlen(b));
+}
+
+// ---- saved conversations ----
+//
+// Each one is a file in .barb\sessions in the working directory, named for when it started
+// (YYYYMMDD-HHMMSS.json); the format is in docs/SESSIONS.md. The agent writes them; this finds
+// them, lists them and reads the one to take up.
+
+static DWORD attrs_of(const char* p) {
+    wchar_t* w = ops_wide(p, strlen(p));
+    DWORD a = w ? GetFileAttributesW(w) : INVALID_FILE_ATTRIBUTES;
+    free(w);
+    return a;
+}
+static int exists(const char* p) { return attrs_of(p) != INVALID_FILE_ATTRIBUTES; }
+static int is_file(const char* p) { DWORD a = attrs_of(p); return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY); }
+
+typedef struct { char name[520]; uint64_t t; } sfile_t;
+
+// a comes before b: written later, or at the same time with the greater name
+static int newer(const sfile_t* a, const sfile_t* b) {
+    if (a->t != b->t) return a->t > b->t;
+    return strcmp(a->name, b->name) > 0;
+}
+
+// The saved conversations here, newest first, *n of them. free() the result.
+static sfile_t* session_files(size_t* n) {
+    *n = 0;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(L".barb\\sessions\\*", &fd);   // "*.json" would match short names too
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    sfile_t* v = 0;
+    size_t cap = 0;
+    do {
+        if (fd.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_DEVICE)) continue;
+        char* name = ops_utf8(fd.cFileName, -1);
+        size_t l = name ? strlen(name) : 0;
+        if (l < 5 || strcmp(name + l - 5, ".json") || name[0] == '.' || l >= sizeof v->name) { free(name); continue; }
+        if (*n == cap) {
+            size_t c = cap ? cap * 2 : 16;
+            sfile_t* q = realloc(v, c * sizeof *v);
+            if (!q) { free(name); break; }
+            v = q;
+            cap = c;
+        }
+        memcpy(v[*n].name, name, l + 1);
+        v[*n].t = ((uint64_t)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
+        free(name);
+        (*n)++;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    for (size_t i = 1; i < *n; i++) {
+        sfile_t x = v[i];
+        size_t j = i;
+        for (; j && newer(&x, &v[j - 1]); j--) v[j] = v[j - 1];
+        v[j] = x;
+    }
+    return v;
+}
+
+// A whole file, NUL after it; 0 with *err set if it cannot be read.
+static char* read_file(const char* path, size_t* n, DWORD* err) {
+    *n = 0;
+    *err = 0;
+    wchar_t* w = ops_wide(path, strlen(path));
+    HANDLE h = w ? CreateFileW(w, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0, OPEN_EXISTING,
+                               FILE_FLAG_SEQUENTIAL_SCAN, 0) : INVALID_HANDLE_VALUE;
+    if (h == INVALID_HANDLE_VALUE) { *err = w ? GetLastError() : ERROR_NOT_ENOUGH_MEMORY; free(w); return 0; }
+    free(w);
+    size_t cap = 65536;
+    char* b = malloc(cap);
+    DWORD got;
+    while (b) {
+        if (!ReadFile(h, b + *n, (DWORD)(cap - *n - 1), &got, 0)) { *err = GetLastError(); break; }
+        if (!got) break;
+        *n += got;
+        if (cap - *n < 2) {
+            char* q = realloc(b, cap * 2);
+            if (!q) { *err = ERROR_NOT_ENOUGH_MEMORY; break; }
+            b = q;
+            cap *= 2;
+        }
+    }
+    CloseHandle(h);
+    if (!b) *err = ERROR_NOT_ENOUGH_MEMORY;
+    if (*err) { free(b); return 0; }
+    b[*n] = 0;
+    return b;
+}
+
+// What --sessions prints: the newest saved conversations here, each with its size and how it began.
+static void list_sessions(void) {
+    size_t n;
+    sfile_t* v = session_files(&n);
+    char line[1024];
+    if (!n) { static const char none[] = "No saved conversations in this directory.\n"; out(none, sizeof none - 1); }
+    arena_t a;
+    arena_init(&a, &mem);
+    for (size_t i = 0; i < n && i < 20; i++) {
+        char p[600];
+        snprintf(p, sizeof p, "%s/%s", SESSIONS_DIR, v[i].name);
+        int stem = (int)strlen(v[i].name) - 5;
+        size_t dn, nm;
+        str_t first;
+        DWORD e;
+        char* data = read_file(p, &dn, &e);
+        if (!data || !session_summary(&a, str_of(data, dn), &nm, &first))
+            snprintf(line, sizeof line, "%.*s  (unreadable)\n", stem, v[i].name);
+        else
+            snprintf(line, sizeof line, "%.*s  %4zu messages  %.*s\n", stem, v[i].name, nm, (int)first.n, first.p);
+        out(line, strlen(line));
+        free(data);
+        arena_free_all(&a);
+    }
+    if (n > 20) { snprintf(line, sizeof line, "(%zu older ones not shown)\n", n - 20); out(line, strlen(line)); }
+    free(v);
+}
+
+enum { START_NEW, START_CONTINUE, START_RESUME };
+
+static void fail2(const char* a, const char* b, const char* c) {
+    errz("barb: ");
+    errz(a);
+    errz(b);
+    errz(c);
+    errz("\n");
+}
+
+// What this run does about saved conversations: where it saves (path, empty for nowhere) and,
+// to take one up, its contents and the model it was saved with. 0 once it has said why it cannot.
+static int plan(int start, const char* resume, int no_save, char* path, size_t cap, char** data, size_t* dn,
+                char** saved_model) {
+    path[0] = 0;
+    if (start == START_NEW) {
+        if (no_save) return 1;
+        time_t now = time(0);
+        struct tm lt;
+        int t[6] = { 1970, 1, 1, 0, 0, 0 };
+        if (localtime_s(&lt, &now) == 0) {
+            t[0] = lt.tm_year + 1900; t[1] = lt.tm_mon + 1; t[2] = lt.tm_mday;
+            t[3] = lt.tm_hour; t[4] = lt.tm_min; t[5] = lt.tm_sec;
+        }
+        char name[48];
+        for (int k = 0; session_new_name(name, t, k); k++) {
+            snprintf(path, cap, "%s/%s.json", SESSIONS_DIR, name);
+            if (!exists(path)) return 1;
+        }
+        session_new_name(name, t, 0);
+        snprintf(path, cap, "%s/%s-%lu.json", SESSIONS_DIR, name, (unsigned long)GetCurrentProcessId());
+        return 1;
+    }
+    if (start == START_CONTINUE) {
+        size_t n;
+        sfile_t* v = session_files(&n);
+        if (n) snprintf(path, cap, "%s/%s", SESSIONS_DIR, v[0].name);
+        free(v);
+        if (!n) { errz("barb: there is no saved conversation in this directory to continue\n"); return 0; }
+    } else if (!session_file(path, cap, resume, 1)) {
+        fail2("cannot read ", resume, ": the name is too long");
+        return 0;
+    }
+    DWORD e;
+    *data = read_file(path, dn, &e);
+    if (!*data) {
+        char m[600];
+        snprintf(m, sizeof m, ": %s", ops_why(e));
+        fail2("cannot read ", path, m);
+        return 0;
+    }
+    arena_t a;
+    arena_init(&a, &mem);
+    session_t s;
+    int ok = api_load_session(&a, str_of(*data, *dn), &s);
+    if (ok && s.model.n) *saved_model = dup_n(s.model.p, s.model.n);
+    arena_free_all(&a);
+    if (!ok) { fail2("", path, " is not a saved Barb conversation"); return 0; }
+    if (no_save) path[0] = 0;
+    return 1;
+}
+
+// After a file was written: if it was a saved conversation, keep .barb\ out of git.
+static void wrote(str_t path) {
+    if (!str_starts(path, str_z(SESSIONS_DIR)) || exists(".barb/.gitignore")) return;
+    FILE* f = fopen(".barb/.gitignore", "wb");
+    if (!f) return;
+    fputs("# Barb's saved conversations; not part of the project.\n*\n", f);
+    fclose(f);
+}
+
+// The line shown when an interactive run ends with its conversation saved.
+static void saved_line(str_t path) {
+    if (!path.n || !is_file(path.p)) return;
+    const char* name = path.p;
+    for (const char* q = path.p; *q; q++) if (*q == '/' || *q == '\\') name = q + 1;
+    int n = (int)strlen(name);
+    if (n >= 5 && !strcmp(name + n - 5, ".json")) n -= 5;
+    char b[1400];
+    snprintf(b, sizeof b, "Saved as %.*s; barb -r %.*s takes it up again.\n", n, name, n, name);
+    errz(b);
 }
 
 static char* env_utf8(const wchar_t* name) {
@@ -626,7 +835,9 @@ int wmain(int argc, wchar_t** wargv) {
     char* model_env = env_utf8(L"BARB_MODEL");
     const char* model = model_env;
     const char* cwd_arg = 0;
-    int yes = 0, max_turns = 0, no_instructions = 0;
+    const char* resume = 0;
+    const char* compact_arg = 0;
+    int yes = 0, max_turns = 0, no_instructions = 0, start = START_NEW, no_save = 0, sessions = 0, verbose = 0;
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i] ? argv[i] : "";
         int has_val = i + 1 < argc && argv[i + 1];
@@ -634,9 +845,15 @@ int wmain(int argc, wchar_t** wargv) {
         else if (arg_is(a, "-V", "--version")) { char b[40]; snprintf(b, sizeof b, "barb %s\n", VERSION); out(b, strlen(b)); return 0; }
         else if (arg_is(a, "-y", "--yes")) yes = 1;
         else if (arg_is(a, "--no-instructions", 0)) no_instructions = 1;
+        else if (arg_is(a, "-c", "--continue")) start = START_CONTINUE;
+        else if (arg_is(a, "-r", "--resume") && has_val) { start = START_RESUME; resume = argv[++i]; }
+        else if (arg_is(a, "--no-save", 0)) no_save = 1;
+        else if (arg_is(a, "--sessions", 0)) sessions = 1;
+        else if (arg_is(a, "-v", "--verbose")) verbose = 1;
         else if (arg_is(a, "-p", "--prompt") && has_val) prompt = argv[++i];
         else if (arg_is(a, "-m", "--model") && has_val) model = argv[++i];
         else if (arg_is(a, "-C", "--cwd") && has_val) cwd_arg = argv[++i];
+        else if (arg_is(a, "--compact-at", 0) && has_val) compact_arg = argv[++i];
         else if (arg_is(a, "--max-turns", 0) && has_val) max_turns = atoi(argv[++i]);
         else {
             errz("barb: unknown or incomplete option ");
@@ -646,7 +863,37 @@ int wmain(int argc, wchar_t** wargv) {
             return 2;
         }
     }
-    if (!model || !*model) model = DEFAULT_MODEL;
+    int chosen = model && *model;   // else the model a saved conversation was saved with, if any
+    if (!chosen) model = DEFAULT_MODEL;
+
+    if (cwd_arg) {
+        wchar_t* w = ops_wide(cwd_arg, strlen(cwd_arg));
+        if (!w || !SetCurrentDirectoryW(w)) {
+            errz("barb: cannot change to ");
+            errz(cwd_arg);
+            errz("\n");
+            return 2;
+        }
+        free(w);
+    }
+    if (sessions) { list_sessions(); return 0; }
+    static char sess_path[2048];
+    char* sess_data = 0;
+    char* saved_model = 0;
+    size_t sess_n = 0;
+    if (!plan(start, resume, no_save, sess_path, sizeof sess_path, &sess_data, &sess_n, &saved_model)) return 2;
+    if (!chosen && saved_model) model = saved_model;   // go on with the model it was saved with
+    char* ca_env = compact_arg ? 0 : env_utf8(L"BARB_COMPACT_AT");
+    const char* ca = compact_arg ? compact_arg : ca_env && *ca_env ? ca_env : 0;   // an empty variable is unset
+    int64_t compact_at = ca ? parse_compact_at(str_z(ca)) : DEFAULT_COMPACT_AT;
+    if (compact_at < 0) {
+        char b[600];
+        snprintf(b, sizeof b, "barb: bad compaction point \"%s\": give a token count such as 200000 or 200k (at least %d), or off\n",
+                 ca, MIN_COMPACT_AT);
+        errz(b);
+        return 2;
+    }
+    free(ca_env);
 
     // Take the key out of the environment: every command the model runs inherits it otherwise,
     // and `echo $ANTHROPIC_API_KEY` would show it. Only the platform layer holds it from here.
@@ -665,16 +912,6 @@ int wmain(int argc, wchar_t** wargv) {
         strncmp(base + 7, "localhost", 9) && strncmp(base + 7, "[::1]", 5))
         errz("barb: warning: ANTHROPIC_BASE_URL is plain http, so your API key will cross the network unencrypted.\n");
 
-    if (cwd_arg) {
-        wchar_t* w = ops_wide(cwd_arg, strlen(cwd_arg));
-        if (!w || !SetCurrentDirectoryW(w)) {
-            errz("barb: cannot change to ");
-            errz(cwd_arg);
-            errz("\n");
-            return 2;
-        }
-        free(w);
-    }
     wchar_t wcwd[32768];
     DWORD cn = GetCurrentDirectoryW(32768, wcwd);
     char* cwd = cn && cn < 32768 ? ops_utf8(wcwd, (int)cn) : dup_n(".", 1);
@@ -735,6 +972,9 @@ int wmain(int argc, wchar_t** wargv) {
     cfg.auto_approve = yes;
     cfg.max_turns = max_turns;
     cfg.instructions = !no_instructions;
+    cfg.session = str_z(sess_path);
+    cfg.verbose = verbose;
+    cfg.compact_at = compact_at;
     agent = agent_new(&mem, &cfg);
     if (!agent) { errz("barb: out of memory\n"); cleanup(); return 1; }
 
@@ -759,10 +999,19 @@ int wmain(int argc, wchar_t** wargv) {
         deliver_simple(EV_INPUT, 0, 0, prompt);
         deliver_simple(EV_EOF, 0, 0, 0);
     }
+    if (sess_data) {   // the queued events wait for the loop, so this comes first
+        const act_t* acts;
+        size_t n;
+        if (agent_resume(agent, str_of(sess_data, sess_n), interactive, &acts, &n))
+            for (size_t i = 0; i < n; i++) exec(&acts[i]);
+        free(sess_data);
+    }
     loop();
     cleanup();
 
+    if (interactive) saved_line(agent_session_path(agent));
     agent_free(agent);
+    free(saved_model);
     SecureZeroMemory(key, strlen(key));
     free(key);
     free(paste);

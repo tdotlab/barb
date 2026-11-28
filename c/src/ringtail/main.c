@@ -18,6 +18,7 @@
 // 50 ms (250 ms for background tasks). That costs a system call, never a model call.
 #include "ulib.h"
 #include "../core/agent.h"
+#include "../core/compact.h"
 #include "ops.h"
 
 #define VERSION "0.2.0"
@@ -538,6 +539,7 @@ int main(int argc, char** argv) {
     cfg.auto_approve = yes;
     cfg.max_turns = max_turns;
     cfg.instructions = !no_instructions;
+    cfg.compact_at = DEFAULT_COMPACT_AT;   // no saved sessions here yet; compaction works as anywhere
     agent = agent_new(&mem, &cfg);
     if (!agent) { outz(STDERR_FILENO, "barb: out of memory\n"); return 1; }
     ops_init(deliver, base, cfg_key, ca);

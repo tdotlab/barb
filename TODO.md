@@ -2,7 +2,7 @@
 
 Barb has two versions (`docs/VERSIONS.md`): `rust/` gets new features, `c/` stays the one built
 into RingTail and gets fixes and what T asks for there. Both are at v0.2.0 and pass their tests on
-Linux and Windows, with every mutation caught. Each task below stands on its own. Model suggestions
+Windows, with every mutation caught (the C version's newest work has not run on Linux yet). Each task below stands on its own. Model suggestions
 are for Claude and Codex: [Claude: Haiku, Sonnet, Opus] [Codex: Luna, Sol].
 
 ## Both
@@ -10,19 +10,6 @@ are for Claude and Codex: [Claude: Haiku, Sonnet, Opus] [Codex: Luna, Sol].
 **A live run of the Rust build.** One real task against a live model on Linux and one on Windows,
 interactive, with a background task and a Ctrl-C, as the C version had. The tests cover the same
 ground, but a live run is what found the C version's last bugs. Sonnet medium, Codex Luna medium.
-
-**Saved sessions, in C.** Rust has them (`-c`, `-r`, `--sessions`, `--no-save`); C should write
-and read the same files, as `docs/SESSIONS.md` describes, including the repair of a cut-off file and
-the resume note. The Rust tests (`core/tests/agent.rs`, the `test_sessions` part of
-`rust/tests/e2e.py`) are the checklist. Sonnet high, Codex Luna high.
-
-**Verbose, in C.** Rust has `-v` and `/verbose`: thinking blocks shown dim and italic, hidden by
-default, and shown again on resume. Sonnet medium.
-
-**Compaction, in C.** T asked for it there. Rust's `core/src/compact.rs` (the prompt, reading the
-summary, the trimming) and the compaction part of `core/src/agent.rs` are the design; its tests
-(the `compact` scenarios in `core/tests/agent.rs`, `test_compaction` in `rust/tests/e2e.py`) are the
-checklist. Needs saved sessions in C first, for the `-2` file. Opus high, Codex Sol high.
 
 **The port's fixes, in C.** The Rust port found three things the C version still has: the
 plain-http warning matches `http://localhost.evil.com` as local (parse the host), the atomic-write
@@ -78,6 +65,15 @@ over its heap) and a platform module like `barb/src/posix` for its jobs, `fetch`
 Opus high for the target, Codex Sol high.
 
 ## C
+
+**Saved sessions on RingTail.** The C core saves and resumes, but `c/src/ringtail` finds no files
+and sets no path: it needs the session listing, `-c`, `-r`, `--sessions`, `--no-save` and `-v` that
+`c/src/posix/main.c` has, over RingTail's calls, and dim thinking in its display. Sonnet medium,
+Codex Luna high.
+
+**Linux.** Saved sessions, verbose and compaction (2026-11-28) were tested on Windows only;
+`src/posix/main.c` has been syntax-checked and never run. `make test`, then `python3 tools/mutate.py`
+on Linux. Sonnet medium.
 
 **RingTail's copy.** `c/tools/to_ringtail.sh PATH/TO/RINGTAIL` copies the core and the RingTail
 platform into RingTail's `vendor/barb`. Run it after a change here, then RingTail's `make test`.

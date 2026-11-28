@@ -64,8 +64,10 @@ typedef enum {
 } actk_t;
 
 // SAY_USAGE is the token count after each reply: a platform with a status line can show it there
-// instead of printing it, and one without can treat it as SAY_INFO.
-enum { SAY_ASSISTANT, SAY_TOOL, SAY_INFO, SAY_ERROR, SAY_USAGE };
+// instead of printing it, and one without can treat it as SAY_INFO. SAY_USER is what the user
+// said, shown again when a saved conversation is resumed (what they type is already on the
+// screen). SAY_THINKING is the model's thinking, said only when verbose is on.
+enum { SAY_ASSISTANT, SAY_TOOL, SAY_INFO, SAY_ERROR, SAY_USAGE, SAY_USER, SAY_THINKING };
 
 typedef struct {
     actk_t kind;
@@ -85,6 +87,13 @@ typedef struct {
     int max_turns;           // model calls per user message (a runaway guard); 0 for the default
     int instructions;        // before the first request, read AGENTS.md (or else CLAUDE.md) from the working
                              // directory, with the files its "@file" lines name, into the system prompt
+    str_t session;           // save the conversation to this file (docs/SESSIONS.md) each time it changes,
+                             // with ACT_WRITE; empty for not at all. After /clear or a compaction it goes
+                             // on in "<name>-2.json", "-3", and so on (agent_session_path).
+    int verbose;             // show the model's thinking (SAY_THINKING); /verbose switches it
+    int64_t compact_at;      // compact the conversation before a request once it takes this many tokens,
+                             // and when the API says it no longer fits; 0 for neither (/compact still
+                             // works). Pass DEFAULT_COMPACT_AT (compact.h) unless the user says otherwise.
 } agent_cfg_t;
 
 typedef struct agent agent_t;
@@ -95,6 +104,15 @@ void agent_free(agent_t* g);
 
 // Feed one event; get the actions to carry out, in order.
 const act_t* agent_step(agent_t* g, const ev_t* ev, size_t* n);
+
+// Take up a saved conversation (a session file's contents), before any event. With `show`, what
+// was said is shown again (the last messages of it). 0 if `data` is not a session file; else 1,
+// with the actions in *acts and *n, as from agent_step.
+int agent_resume(agent_t* g, str_t data, int show, const act_t** acts, size_t* n);
+
+// The file the conversation is saved to now: cfg.session, or after /clear or a compaction its
+// "-2", "-3", ... sibling. Empty if it is not saved. Valid as long as the agent; NUL after it.
+str_t agent_session_path(const agent_t* g);
 
 // 1 while the agent is working on a turn (asking the model, running tools, reading the project's
 // instructions); 0 when it is waiting for the user, even if background tasks or timers are pending.

@@ -236,9 +236,41 @@ static void follow_up(sc_t* s, int style, const char* p, size_t n) {
     }
 }
 
+// What the user said, shown again when a saved conversation is taken up: each line under a "> ".
+static void user(sc_t* s, const char* p, size_t n) {
+    gap(s, 2, G_USER);
+    int st = styled(s, 2);
+    for (size_t i = 0, k = 0;; k++) {
+        size_t e = i;
+        while (e < n && p[e] != '\n') e++;
+        wrz(s, 2, k ? "  " : st ? "\033[1;35m> \033[0m" : "> ");
+        safe(s, 2, p + i, e - i);
+        wrz(s, 2, "\n");
+        if (e >= n) break;
+        i = e + 1;
+    }
+}
+
+// The model's thinking: dim and italic, every line, so it reads as an aside. Spaced like a reply.
+static void thinking(sc_t* s, const char* p, size_t n) {
+    gap(s, 2, G_ASSIST);
+    int st = styled(s, 2);
+    for (size_t i = 0;;) {
+        size_t e = i;
+        while (e < n && p[e] != '\n') e++;
+        if (st) wrz(s, 2, "\033[2;3m");
+        safe(s, 2, p + i, e - i);
+        wrz(s, 2, st ? "\033[0m\n" : "\n");
+        if (e >= n) break;
+        i = e + 1;
+    }
+}
+
 void sc_say(sc_t* s, int style, const char* p, size_t n) {
     clear(s);
     if (style == SAY_ASSISTANT) { assistant(s, p, n); return; }
+    if (style == SAY_USER) { user(s, p, n); return; }
+    if (style == SAY_THINKING) { thinking(s, p, n); return; }
     int follow = n && p[0] == ' ';
     if (!styled(s, 2)) {
         if (!follow) s->last = style == SAY_TOOL ? G_TOOL : G_NOTE;

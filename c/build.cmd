@@ -16,7 +16,7 @@ where cl.exe >nul 2>nul
 if errorlevel 1 call :find_msvc || exit /b 1
 
 if not exist build\san mkdir build\san
-set CORE=src\core\arena.c src\core\str.c src\core\json.c src\core\api.c src\core\agent.c src\core\tools.c
+set CORE=src\core\arena.c src\core\str.c src\core\json.c src\core\api.c src\core\agent.c src\core\tools.c src\core\compact.c
 set WIN=src\win32\ops.c src\ui\edit.c src\ui\md.c src\ui\screen.c src\win32\main.c
 set LIBS=advapi32.lib
 rem /utf-8: the sources are UTF-8. /std:c11: the core is ISO C11.

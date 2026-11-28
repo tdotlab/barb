@@ -40,5 +40,7 @@ void ops_shutdown(void);               // kill everything still running, remove 
 // UTF-8 and UTF-16, for main.c too. The result is malloc'd (0 if memory ran out).
 wchar_t* ops_wide(const char* s, size_t n);
 char* ops_utf8(const wchar_t* w, int n);   // n < 0: up to the NUL
+// The system's message for a Windows error code, in UTF-8 (valid until the next call).
+const char* ops_why(unsigned long err);
 
 #endif

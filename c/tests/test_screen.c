@@ -238,6 +238,38 @@ static void test_lite(void) {
     CHECK(escapes_ok(out, outn));
 }
 
+// ---- what a resumed conversation shows again: the user's lines, and thinking with -v ----
+
+static void test_replay(void) {
+    setup(SC_PIPE, 0, 80);
+    say(SAY_USER, "one\ntwo");
+    say(SAY_THINKING, "hmm\nmore");
+    say(SAY_USER, "bad\033[31m\x7F");
+    say(SAY_THINKING, "odd\033[2J");
+    CHECK(!strcmp(fd2, "> one\n  two\nhmm\nmore\n> bad^[[31m^?\nodd^[[2J\n"));
+    CHECK(!*fd1);
+
+    setup(SC_LITE, 1, 80);
+    say(SAY_INFO, "note");
+    say(SAY_USER, "one\ntwo");
+    say(SAY_USER, "three");
+    say(SAY_THINKING, "hmm\nmore");
+    say(SAY_USER, "x\033]0;t\007");
+    CHECK(!strcmp(row(0), "note"));
+    CHECK(!strcmp(row(1), ""));            // a gap before the user's line after something else
+    CHECK(!strcmp(row(2), "> one"));
+    CHECK(!strcmp(row(3), "  two"));
+    CHECK(!strcmp(row(4), "> three"));     // but none between two of them
+    CHECK(!strcmp(row(5), ""));
+    CHECK(!strcmp(row(6), "hmm"));
+    CHECK(!strcmp(row(7), "more"));
+    CHECK(!strcmp(row(8), ""));
+    CHECK(!strcmp(row(9), "> x^[]0;t^G"));
+    CHECK(has("\033[1;35m> \033[0mone\n  two\n"));
+    CHECK(has("\033[2;3mhmm\033[0m\n\033[2;3mmore\033[0m\n"));
+    CHECK(escapes_ok(out, outn));
+}
+
 // ---- REGION: the block ----
 
 static void check_block(int top, const char* activity, const char* line, const char* footer_left, const char* hint) {
@@ -731,6 +763,7 @@ static void test_random(void) {
 int main(void) {
     test_pipe();
     test_lite();
+    test_replay();
     test_region();
     test_activity();
     test_cwd();

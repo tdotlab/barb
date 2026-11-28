@@ -785,6 +785,144 @@ def test_instructions():
     fake.stop()
 
 
+def saved(d):
+    """The saved conversations in d, by name, and what each holds."""
+    sd = os.path.join(d, ".barb", "sessions")
+    out = {}
+    for n in sorted(os.listdir(sd)) if os.path.isdir(sd) else []:
+        with open(os.path.join(sd, n), encoding="utf-8") as f:
+            raw = f.read()
+        out[n] = (json.loads(raw), raw)
+    return out
+
+
+def texts_of(msgs):
+    """Each message as (role, its text blocks joined)."""
+    return [(m["role"], " ".join(b.get("text", "") for b in m["content"] if b.get("type") == "text")) for m in msgs]
+
+
+def test_sessions():
+    """Saved conversations: written as the run goes, kept out of git, taken up with -c and -r, listed
+    with --sessions; --no-save writes nothing."""
+    d = tempfile.mkdtemp()
+    fake = Fake([text("first answer"), text("second answer"), text("third answer"), text("pty answer")])
+    p, _ = run(fake, ["-p", "remember 42", "-m", "m-old"], d)
+    check(p.returncode == 0, f"exit {p.returncode}: {p.stderr}")
+    s = saved(d)
+    check(len(s) == 1 and re.fullmatch(r"\d{8}-\d{6}\.json", next(iter(s), "")), f"one file, named for its time: {list(s)}")
+    name = next(iter(s), "x.json")
+    stem = name[:-5]
+    doc, raw = s.get(name, ({}, ""))
+    check(doc.get("barb_session") == 1 and doc.get("model") == "m-old" and doc.get("cwd") == os.path.realpath(d),
+          f"the header: {raw[:200]!r}")
+    check(texts_of(doc.get("messages", [])) == [("user", "remember 42"), ("assistant", "first answer")], f"messages {raw!r}")
+    check("cache_control" not in raw, "no cache marks in the file")
+    gi = os.path.join(d, ".barb", ".gitignore")
+    check(os.path.exists(gi) and "*" in open(gi).read().split(), "the sessions are kept out of git")
+
+    # -c takes up the newest, with the model it was saved with, and goes on saving to it.
+    p, _ = run(fake, ["-c", "-p", "what was it"], d)
+    check(p.returncode == 0, f"-c exit {p.returncode}: {p.stderr}")
+    req = fake.requests[1] if len(fake.requests) > 1 else {"messages": [], "model": ""}
+    check(req["model"] == "m-old", f"-c goes on with the saved model, got {req['model']!r}")
+    sent = texts_of(req["messages"])
+    check(sent[:2] == [("user", "remember 42"), ("assistant", "first answer")] and len(sent) == 3,
+          f"-c sent the old conversation: {sent}")
+    check(last_user_texts(req)[-2:] == ["[barb] This conversation was saved and is being resumed now. Files may have "
+                                         "changed since, so read a file again before you edit it.", "what was it"]
+          if req["messages"] else False, f"with a note before the new message: {last_user_texts(req) if req['messages'] else None}")
+    s = saved(d)
+    check(list(s) == [name] and len(s[name][0]["messages"]) == 4, f"saved to the same file: {list(s)}")
+
+    # --sessions lists it; -r NAME takes it up; --no-save leaves the file as it was.
+    p, _ = run(fake, ["--sessions"], d)
+    check(p.returncode == 0 and stem in p.stdout and "4 messages" in p.stdout and "remember 42" in p.stdout,
+          f"--sessions: {p.stdout!r}")
+    p, _ = run(fake, ["-r", stem, "-p", "and again", "--no-save", "-m", "m-new"], d)
+    check(p.returncode == 0, f"-r exit {p.returncode}: {p.stderr}")
+    req = fake.requests[2] if len(fake.requests) > 2 else {"messages": [], "model": ""}
+    check(req["model"] == "m-new" and len(req["messages"]) == 5, f"-r with -m: {req['model']!r}, {len(req['messages'])} messages")
+    s = saved(d)
+    check(list(s) == [name] and len(s[name][0]["messages"]) == 4, "--no-save left the file alone")
+
+    # On a terminal, -c shows the conversation again, and the end says how to take it up.
+    code, out, left = pty_session([BARB, "-c"], d, env_for(fake), [
+        ("first answer", ""), ("> ", "one more\n"), ("pty answer", "\x04")], timeout=30)
+    plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", out)
+    check(not left and code == 0, f"pty -c: exit {code}, left {[x[0] for x in left]}\n{out!r}")
+    check("> remember 42" in plain and "second answer" in plain, f"the conversation is shown again: {plain!r}")
+    check(f"Saved as {stem}; barb -r {stem} takes it up again." in plain, f"the saved line: {plain[-300:]!r}")
+    check(len(saved(d).get(name, ({"messages": []},))[0]["messages"]) == 6, "the terminal run saved to it too")
+    no_problems(fake, "sessions")
+    fake.stop()
+
+    # What cannot be taken up, and a run that saves nothing.
+    e = tempfile.mkdtemp()
+    fake = Fake([text("unsaved")])
+    p, _ = run(fake, ["-c", "-p", "x"], e)
+    check(p.returncode == 2 and "no saved conversation" in p.stderr, f"-c with none: {p.returncode} {p.stderr!r}")
+    p, _ = run(fake, ["-r", "nope", "-p", "x"], e)
+    check(p.returncode == 2 and "cannot read" in p.stderr, f"-r missing: {p.returncode} {p.stderr!r}")
+    os.makedirs(os.path.join(e, ".barb", "sessions"))
+    with open(os.path.join(e, ".barb", "sessions", "bad.json"), "w") as f: f.write("{\"not\": \"barb\"}")
+    p, _ = run(fake, ["-r", "bad", "-p", "x"], e)
+    check(p.returncode == 2 and "is not a saved Barb conversation" in p.stderr, f"-r junk: {p.returncode} {p.stderr!r}")
+    p, _ = run(fake, ["--sessions"], e)
+    check("bad  (unreadable)" in p.stdout, f"--sessions with junk: {p.stdout!r}")
+    os.remove(os.path.join(e, ".barb", "sessions", "bad.json"))
+    p, _ = run(fake, ["-p", "x", "--no-save"], e)
+    check(p.returncode == 0 and p.stdout == "unsaved\n" and not saved(e), f"--no-save: {p.returncode} {list(saved(e))}")
+    check(len(fake.requests) == 1, "no request for what could not start")
+    fake.stop()
+
+
+def test_verbose_and_compaction():
+    d = tempfile.mkdtemp()
+    thought = {"type": "message", "role": "assistant", "stop_reason": "end_turn", "usage": {"input_tokens": 50, "output_tokens": 10},
+               "content": [{"type": "thinking", "thinking": "pondering the matter", "signature": "c2ln"},
+                           {"type": "text", "text": "answer"}]}
+    fake = Fake([thought, thought])
+    p, _ = run(fake, ["-p", "x", "-v"], d)
+    check(p.returncode == 0 and p.stdout == "answer\n" and "pondering the matter" in p.stderr, f"-v: {p.stdout!r} {p.stderr!r}")
+    check(fake.requests[0].get("thinking") == {"type": "adaptive", "display": "summarized"}, f"-v asks for thinking: {fake.requests[0].get('thinking')}")
+    p, _ = run(fake, ["-p", "x"], d)
+    check(p.returncode == 0 and "pondering" not in p.stderr, f"no -v: {p.stderr!r}")
+    check(len(fake.requests) == 2 and "thinking" not in fake.requests[1], "no thinking asked for without -v")
+    fake.stop()
+
+    # Past --compact-at, the conversation is compacted before the next request, into a new file.
+    big = tools(("bash", {"command": "echo hi"}))
+    big["usage"] = {"input_tokens": 5000, "output_tokens": 10}
+    e = tempfile.mkdtemp()
+    fake = Fake([big, text("<analysis>looking back</analysis>\n<summary>Ran echo for the user.</summary>"), text("carried on")])
+    p, _ = run(fake, ["-p", "do it", "--yes", "--compact-at", "1k"], e)
+    check(p.returncode == 0 and p.stdout == "carried on\n", f"compaction run: {p.returncode} {p.stdout!r} {p.stderr!r}")
+    check("(compacting the conversation" in p.stderr and "(compacted: " in p.stderr, f"it says so: {p.stderr!r}")
+    if len(fake.requests) == 3:
+        ask, after = fake.requests[1], fake.requests[2]
+        check(any("Stop the task here" in t for t in last_user_texts(ask)), f"the compaction request: {last_user_texts(ask)}")
+        first = texts_of(after["messages"])[0][1]
+        check(first.startswith("[barb] This conversation was compacted") and "Ran echo for the user." in first,
+              f"the next request starts from the summary: {first[:200]!r}")
+        check(len(after["messages"]) == 1, f"and only that: {len(after['messages'])} messages")
+    else:
+        check(False, f"{len(fake.requests)} requests")
+    s = saved(e)
+    names = sorted(s, key=len)
+    check(len(names) == 2 and names[1] == names[0][:-5] + "-2.json", f"a new part after compaction: {names}")
+    if len(names) == 2:
+        check(len(s[names[0]][0]["messages"]) == 3, "the old part keeps the whole conversation")
+        check(texts_of(s[names[1]][0]["messages"])[-1] == ("assistant", "carried on"), "the new part goes on from the summary")
+    no_problems(fake, "compaction")
+    fake.stop()
+
+    # Bad compaction points stop barb before it starts.
+    env = env_for(fake)
+    for args, extra in ((["--compact-at", "12"], {}), (["--compact-at", "lots"], {}), ([], {"BARB_COMPACT_AT": "9x"})):
+        q = subprocess.run([BARB, "-p", "x"] + args, cwd=e, env={**env, **extra}, capture_output=True, **TEXT)
+        check(q.returncode == 2 and "bad compaction point" in q.stderr, f"{args or extra}: {q.returncode} {q.stderr!r}")
+
+
 def test_startup_errors():
     d = tempfile.mkdtemp()
     bare = {k: v for k, v in os.environ.items() if k.upper() in ("PATH", "SYSTEMROOT")}
@@ -799,7 +937,8 @@ def test_startup_errors():
 if __name__ == "__main__":
     for t in (test_startup_errors, test_files_and_bash, test_key_not_inherited, test_background_wake, test_timeout_and_interrupt,
               test_permissions_and_errors, test_interactive_pipe, test_interactive_interrupt, test_interactive_permissions,
-              test_one_key_typeahead, test_line_editing, test_paste, test_suspend, test_instructions):
+              test_one_key_typeahead, test_line_editing, test_paste, test_suspend, test_instructions, test_sessions,
+              test_verbose_and_compaction):
         t()
     print(f"e2e: {checks} checks, {failed} failed")
     sys.exit(1 if failed else 0)

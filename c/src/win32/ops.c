@@ -105,6 +105,8 @@ static const char* why(DWORD err) {
     return out;
 }
 
+const char* ops_why(unsigned long err) { return why((DWORD)err); }
+
 // ---- growing buffers ----
 
 typedef struct {

@@ -8,6 +8,7 @@
 #include "check.h"
 #include "../src/core/agent.h"
 #include "../src/core/json.h"
+#include "../src/core/compact.h"
 
 #define J(...) #__VA_ARGS__
 
@@ -226,7 +227,18 @@ static void w_act(world_t* w, const act_t* a) {
         op_t* o = &w->ops[w->nops++];
         memset(o, 0, sizeof *o);
         o->id = a->id; o->kind = a->kind; o->a = strdup(path);
-        if (a->kind == ACT_WRITE) { o->c = dupn(a->b.p, a->b.n); }
+        if (a->kind == ACT_WRITE) {
+            o->c = dupn(a->b.p, a->b.n);
+            // A saved conversation must load again, and carries no cache marks.
+            if (a->b.n > 15 && !memcmp(a->b.p, "{\"barb_session\"", 15)) {
+                arena_t sa;
+                arena_init(&sa, &plain_mem);
+                session_t s;
+                CHECK(api_load_session(&sa, a->b, &s));
+                CHECK(str_find(a->b, str_z("cache_control")) == STR_NONE);
+                arena_free_all(&sa);
+            }
+        }
         if (w->hold_fs) break;
         ev_t e = { EV_FILE, a->id, FS_OK, 0, str_of(0, 0), str_of(0, 0), 0 };
         if (a->kind == ACT_WRITE) {
@@ -318,7 +330,13 @@ static op_t* w_op(world_t* w, int64_t id) {
     return 0;
 }
 
-static world_t* w_new_cfg(int auto_approve, int max_turns, int instructions) {
+typedef struct {
+    int auto_approve, max_turns, instructions, verbose;
+    const char* session;    // 0: not saved
+    int64_t compact_at;
+} w_opts_t;
+
+static world_t* w_new_opts(w_opts_t o) {
     world_t* w = calloc(1, sizeof *w);
     agent_cfg_t cfg;
     memset(&cfg, 0, sizeof cfg);
@@ -326,12 +344,29 @@ static world_t* w_new_cfg(int auto_approve, int max_turns, int instructions) {
     cfg.cwd = str_z("/work");
     cfg.platform = str_z("TestOS");
     cfg.date = str_z("2026-11-21");
-    cfg.auto_approve = auto_approve;
-    cfg.max_turns = max_turns;
-    cfg.instructions = instructions;
+    cfg.auto_approve = o.auto_approve;
+    cfg.max_turns = o.max_turns;
+    cfg.instructions = o.instructions;
+    cfg.verbose = o.verbose;
+    cfg.session = str_z(o.session ? o.session : "");
+    cfg.compact_at = o.compact_at;
     w->g = agent_new(&test_mem, &cfg);
     w->ask_answer = -1;
     return w;
+}
+static world_t* w_new_cfg(int auto_approve, int max_turns, int instructions) {
+    w_opts_t o = { auto_approve, max_turns, instructions, 0, 0, 0 };
+    return w_new_opts(o);
+}
+
+// Carry out what agent_resume returned, then what follows from it.
+static int w_resume(world_t* w, const char* data, int show) {
+    const act_t* acts;
+    size_t n;
+    int ok = agent_resume(w->g, str_z(data), show, &acts, &n);
+    for (size_t i = 0; i < n; i++) w_act(w, &acts[i]);
+    w_run(w);
+    return ok;
 }
 static world_t* w_new_turns(int auto_approve, int max_turns) { return w_new_cfg(auto_approve, max_turns, 0); }
 static world_t* w_new(int auto_approve) { return w_new_turns(auto_approve, 0); }

@@ -55,7 +55,8 @@ out-of-memory test tries it at every allocation point of a long scenario.
 | `src/core/str.c` | slices and a growing buffer | `test_core` |
 | `src/core/json.c` | validating pull reader, lookups, UTF-8-safe writer | `test_core` (corpus, UTF-8 cases, 40,000 fuzz mutations) |
 | `src/core/api.c` | transcript, request body, reply parsing | `test_api` |
-| `src/core/agent.c` | the state machine: turns, retries, interrupts, background tasks | `test_agent` (scenarios, chaos, out of memory) |
+| `src/core/agent.c` | the state machine: turns, retries, interrupts, background tasks, saving, resuming, compaction | `test_agent` (scenarios, chaos, out of memory) |
+| `src/core/compact.c` | compaction's plain parts: the summary prompt, reading the summary, trimming a request that does not fit, the size setting | `test_agent` |
 | `src/core/tools.c` | the six tools and their definitions | `test_agent` |
 | `src/posix/ops.c` | processes, curl, files, timers, and `ops_wait`, the loop's select(2) (Apple's poll() cannot watch a terminal) | `tests/e2e.py`, `test_wait` |
 | `src/posix/main.c` | arguments, the select loop (`ops_wait`), the terminal in raw mode with bracketed paste, signals (Ctrl-C, Ctrl-Z, resize) through a self-pipe | `tests/e2e.py` (pipes, a pseudo-terminal, one under a job-control parent for Ctrl-Z) |
@@ -124,6 +125,24 @@ reads goes on without them. Because it is all actions and events, every platform
 Ctrl-C during a model call cancels it and adds "[barb] The user interrupted you here, before you
 replied." to the unanswered message, so the model does not take up the old request when the user
 types next. During tool calls, the running call and the ones after it get results that say so.
+
+## Saved conversations
+
+The format is `../docs/SESSIONS.md`. The core makes the bytes and the platform finds the files:
+`cfg.session_path` names where to save (nowhere if empty), the agent writes it with an ordinary
+`WRITE` action at the save points, and picks the next part's name after `/clear` or a compaction.
+To resume, the platform reads the file and hands the bytes to `agent_resume`, which loads and
+repairs the transcript (`api.c`) and returns the actions that show it again. A save that fails is
+reported once and does not stop the conversation. RingTail's platform sets no path.
+
+## Compaction
+
+`compact.c` says how in its opening comment. In the agent it is one more kind of model call
+(`cp.on`): no tools run from its reply, a failure leaves the conversation as it was, Ctrl-C cancels
+it, and a message typed or waiting meanwhile is held and sent after the summary. It starts after a
+reply when the conversation has passed `cfg.compact_at`, from `/compact`, or when the API says a
+request does not fit. The old transcript stays in the `life` arena until Barb exits, so a very long
+session grows by about one conversation's size per compaction.
 
 ## Sleeping and waking
 
