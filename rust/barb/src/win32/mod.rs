@@ -627,6 +627,8 @@ fn usage(h: HANDLE, con: bool) {
          \x20 -p, --prompt TASK   do one task and exit (TASK of - reads it from standard input)\n\
          \x20 -m, --model NAME    the model (default {}, or %BARB_MODEL%; /model changes it)\n\
          \x20     --effort LEVEL  low, medium, high, xhigh or max (or %BARB_EFFORT%; /effort changes it)\n\
+         \x20     --compact-at N  compact the conversation by itself past N tokens: 200k, or off\n\
+         \x20                     (default 150k, or %BARB_COMPACT_AT%; /compact at N changes it)\n\
          \x20 -y, --yes           do not ask before writing files or running commands\n\
          \x20 -C, --cwd DIR       work in DIR\n\
          \x20     --max-turns N   stop after N model calls without you typing (default 60)\n\
@@ -639,7 +641,7 @@ fn usage(h: HANDLE, con: bool) {
          \x20 -V, --version\n\
          \x20 -h, --help\n\n\
          environment: ANTHROPIC_API_KEY (required), ANTHROPIC_BASE_URL, BARB_MODEL, BARB_EFFORT,\n\
-         \x20            BARB_SHELL (the bash.exe to run commands in; Git for Windows' is found by itself)\n",
+         \x20            BARB_COMPACT_AT, BARB_SHELL (the bash.exe to run commands in; Git for Windows' is found by itself)\n",
         VERSION, DEFAULT_MODEL
     );
     write_handle(h, con, text.as_bytes());
@@ -753,6 +755,13 @@ pub fn main() -> i32 {
             return 2;
         }
     };
+    let compact_at = match common::compact_at(&args, std::env::var_os("BARB_COMPACT_AT")) {
+        Ok(n) => n,
+        Err(e) => {
+            err(format!("barb: {}\n", e).as_bytes());
+            return 2;
+        }
+    };
 
     // Take the key out of the environment: every command the model runs inherits it otherwise,
     // and `echo $ANTHROPIC_API_KEY` would show it. Only the platform layer holds it from here.
@@ -836,6 +845,7 @@ pub fn main() -> i32 {
             session: plan.path.clone(),
             verbose: args.verbose,
             effort,
+            compact_at,
         }),
         scr: Screen::new(ScreenConfig {
             mode: if interactive {

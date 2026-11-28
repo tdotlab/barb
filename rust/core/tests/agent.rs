@@ -147,6 +147,7 @@ impl World {
             session: Vec::new(),
             verbose: false,
             effort: Vec::new(),
+            compact_at: 0,
         };
         World::with(cfg)
     }
@@ -1306,12 +1307,21 @@ fn api_errors() {
     assert!(w.done && w.exit_code == 1); // a failed run says so in its exit status
 
     let mut w = World::new(true);
-    w.reply(
-        "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"prompt is too long: 250000 tokens > 200000\"}}",
-        400,
-    );
+    let too_long =
+        "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"prompt is too long: 250000 tokens > 200000\"}}";
+    w.reply_text("hello");
+    w.reply(too_long, 400);
     w.input("hi");
-    assert!(w.said("Use /clear to start over"));
+    w.input("more");
+    // compaction is off in tests by default: it is suggested, not tried
+    assert!(w.said("no longer fits the model's context window. /compact summarizes it to make room; /clear starts over."));
+    assert_eq!(w.bodies.len(), 2);
+    // the first message alone: there is nothing to compact
+    let mut w = World::new(true);
+    w.reply(too_long, 400);
+    w.input("a huge paste");
+    assert!(w.said("The message does not fit the model's context window: send less at a time."));
+    assert!(!w.said("/compact"));
 
     // A 200 that is not a message, and a gateway's HTML error page.
     let mut w = World::new(true);
@@ -1486,8 +1496,10 @@ impl Rnd {
 }
 
 fn random_reply(w: &mut World, r: &mut Rnd) {
-    match r.n(12) {
+    match r.n(14) {
         0..=2 => w.reply_text("Some text."),
+        12 => w.reply(TOO_LONG, 400),
+        13 => w.reply_text("<summary>s</summary>"),
         3 => w.reply_tools(&[tool("a", "read_file", r#"{"path":"f.txt"}"#)]),
         4 => w.reply_tools(&[
             tool("a", "edit_file", r#"{"path":"f.txt","old_string":"x","new_string":"y"}"#),
@@ -1519,22 +1531,23 @@ const ANS_ALL: [Answer; 3] = [Answer::No, Answer::Yes, Answer::Always];
 fn random_events() {
     let mut total_requests = 0;
     let mut resumed = 0;
+    let mut compacted = 0;
     for seed in 1..=400u32 {
         let mut r = Rnd(seed.wrapping_mul(7919));
         let auto = r.n(2) == 1;
         let turns = 1 + r.n(8);
         let instr = r.n(2) == 1;
-        let mut w = World::new_cfg(auto, turns, instr);
-        let saving = r.n(2) == 1;
-        if saving {
-            let mut cfg = test_cfg();
-            cfg.auto_approve = auto;
-            cfg.max_turns = turns;
-            cfg.instructions = instr;
+        let mut cfg = test_cfg();
+        cfg.auto_approve = auto;
+        cfg.max_turns = turns;
+        cfg.instructions = instr;
+        if r.n(2) == 1 {
             cfg.session = b"s.json".to_vec();
             cfg.verbose = r.n(2) == 1;
-            w.g = Agent::new(cfg);
         }
+        // compaction off, or so low that it happens all the time
+        cfg.compact_at = [0, 0, 100][r.n(3) as usize];
+        let mut w = World::with(cfg);
         w.ctx = format!("seed {seed}");
         w.put("f.txt", "x\nx\n");
         if r.n(2) == 1 {
@@ -1553,6 +1566,7 @@ fn random_events() {
             }
             let pick = |w: &World, r: &mut Rnd| w.ops[r.n(w.ops.len() as u32) as usize].id;
             match r.n(10) {
+                0 if r.n(4) == 0 => w.input("/compact"),
                 0 | 1 => w.input("a message"),
                 2 => w.interrupt(),
                 3 if !w.ops.is_empty() => {
@@ -1593,9 +1607,12 @@ fn random_events() {
             }
         }
         total_requests += w.bodies.len();
+        compacted += w.says.iter().filter(|x| x.1.starts_with("(compacted:")).count();
         // Whatever state it was saved in, a saved conversation can be taken up again, and the
         // request that follows keeps the API's rules (check_body runs on it).
-        let saved: Vec<String> = w.ops.iter().filter(|o| o.kind == Kind::Write && o.a == "s.json").map(|o| o.c.clone()).collect();
+        // (After /clear or a compaction that is s-2.json, s-3.json...: the last one written.)
+        let saved: Vec<String> =
+            w.ops.iter().filter(|o| o.kind == Kind::Write && o.a.starts_with('s')).map(|o| o.c.clone()).collect();
         if let Some(last) = saved.last() {
             let mut v = World::new(true);
             v.ctx = format!("seed {seed}, resumed");
@@ -1610,6 +1627,7 @@ fn random_events() {
         }
     }
     assert!(resumed > 50, "only {resumed} saved conversations resumed");
+    assert!(compacted > 30, "only {compacted} compactions");
     // the chaos did get as far as asking the model, a lot
     assert!(total_requests > 400, "only {total_requests} requests");
 }
@@ -1931,4 +1949,366 @@ fn model_and_effort() {
     assert!(w.said("Unknown command /modelx"));
     w.input("/help");
     assert!(w.said("/model [NAME]") && w.said("/effort [LEVEL]"));
+}
+
+// ---- compaction ----
+
+/// A reply that says the conversation now takes `tokens` input tokens.
+fn mk_reply_tok(stop: &str, content: &str, tokens: i64) -> String {
+    mk_reply(stop, content).replace("\"input_tokens\":100", &format!("\"input_tokens\":{tokens}"))
+}
+fn text_blocks(t: &str) -> String {
+    format!("[{{\"type\":\"text\",\"text\":\"{t}\"}}]")
+}
+const TOO_LONG: &str =
+    "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"prompt is too long: 250000 tokens > 200000 maximum\"}}";
+
+/// The number of messages in request `i`.
+fn msg_count(w: &World, i: usize) -> usize {
+    elems(json::get(w.bodies[i].as_bytes(), "messages").unwrap()).unwrap().len()
+}
+
+fn compacting_at(n: i64) -> Config {
+    let mut cfg = test_cfg();
+    cfg.compact_at = n;
+    cfg
+}
+
+#[test]
+fn compacts_by_itself() {
+    let mut cfg = compacting_at(1000);
+    cfg.session = b"c.json".to_vec();
+    let mut w = World::with(cfg);
+    w.reply(&mk_reply_tok("end_turn", &text_blocks("one"), 1200), 200);
+    w.input("first question");
+    assert_eq!(w.bodies.len(), 1);
+    w.reply_text("<analysis>notes</analysis><summary>SUMMARY-A</summary>");
+    w.reply_text("two");
+    w.input("second question");
+    assert_eq!(w.bodies.len(), 3, "the summary request, then the request it held back");
+    assert!(w.said("(compacting the conversation: it takes 1220 tokens, past the 1000 set for it)"));
+
+    // The summary request is the conversation as it was, with the same system prompt and tools
+    // (so the prompt cache holds), and the instruction last.
+    let (a, b) = (w.bodies[0].as_bytes(), w.bodies[1].as_bytes());
+    assert_eq!(json::get(a, "system"), json::get(b, "system"));
+    assert_eq!(json::get(a, "tools"), json::get(b, "tools"));
+    assert_eq!(msg_count(&w, 1), 3);
+    assert!(w.bodies[1].contains("first question") && w.bodies[1].contains("\"text\":\"one\""));
+    let last = w.bodies[1].rfind("\"text\":\"[barb] Stop the task here.").expect("the instruction");
+    assert!(w.bodies[1].find("second question").unwrap() < last, "it comes after what the user just said");
+
+    // After: one message, the summary, then the user's newest words as they typed them.
+    let c = &w.bodies[2];
+    assert_eq!(msg_count(&w, 2), 1);
+    assert!(c.contains("\"text\":\"[barb] This conversation was compacted to fit the context window"), "{c}");
+    assert!(c.contains("<summary>\\nSUMMARY-A\\n</summary>") && !c.contains("notes"), "only the summary: {c}");
+    assert!(c.contains("\"text\":\"second question\""), "{c}");
+    assert!(!c.contains("first question") && !c.contains("Stop the task here"), "{c}");
+    assert!(w.said("two"));
+    assert!(w.said("[tokens: 100 in, 20 out, for the summary]"));
+    assert!(w.said("(compacted: 3 messages became a summary; the whole conversation is still in c.json)"));
+
+    // The whole conversation stays in its file; the compacted one goes on in the next.
+    assert_eq!(w.g.session_path(), b"c-2.json");
+    let old = w.file("c.json").unwrap();
+    assert!(old.contains("first question") && old.contains("second question") && !old.contains("SUMMARY-A"), "{old}");
+    let new = w.file("c-2.json").unwrap();
+    assert!(new.contains("SUMMARY-A") && new.contains("second question") && new.contains("\"text\":\"two\""), "{new}");
+    assert!(!new.contains("first question"), "{new}");
+
+    // Small again: the next request goes straight out.
+    w.reply_text("three");
+    w.input("third");
+    assert_eq!(w.bodies.len(), 4);
+    assert_eq!(msg_count(&w, 3), 3);
+
+    // Taken up again, it says it was compacted, and shows what came after.
+    let mut v = World::new(true);
+    for a in v.g.resume(new.as_bytes(), true).unwrap() {
+        v.act(a);
+    }
+    let shown: Vec<(Style, &str)> = v.says.iter().map(|x| (x.0, x.1.as_str())).collect();
+    assert_eq!(
+        shown,
+        [
+            (Style::Info, "(the earlier part of this conversation was compacted into a summary)"),
+            (Style::User, "second question"),
+            (Style::Assistant, "two"),
+        ]
+    );
+}
+
+#[test]
+fn compacts_in_the_middle_of_a_task() {
+    let mut w = World::with(compacting_at(1000));
+    w.reply(&mk_reply_tok("tool_use", &format!("[{}]", tool("t1", "bash", r#"{"command":"make"}"#)), 1500), 200);
+    w.hold_proc = true;
+    w.input("build it");
+    w.input("and check the docs"); // typed while the tool runs: it goes with the results
+    let id = w.last_op(Kind::Spawn);
+    w.reply_text("<summary>S-MID</summary>");
+    w.reply_text("next");
+    w.proc_ev(id, 0, 0, "built");
+    assert_eq!(w.bodies.len(), 3);
+    // the summary request has the results (check_body: every tool_use answered)
+    assert!(w.bodies[1].contains("\"tool_use_id\":\"t1\"") && w.bodies[1].contains("Stop the task here"));
+    // and after it no tool_use is left without its result, because none is left
+    let b = &w.bodies[2];
+    assert_eq!(msg_count(&w, 2), 1);
+    assert!(!b.contains("tool_use") && !b.contains("tool_result"), "{b}");
+    assert!(b.contains("S-MID") && b.contains("If you were in the middle of a task, take the next step"), "{b}");
+    assert!(b.contains("and check the docs"), "what the user typed meanwhile: {b}");
+    assert!(w.said("next"));
+}
+
+#[test]
+fn compact_command() {
+    let mut w = World::new(true);
+    w.input("/help");
+    assert!(w.said("/compact [FOCUS]") && w.said("/compact at [N]"));
+    w.input("/compact");
+    assert!(w.said("Nothing to compact yet."));
+    assert!(w.bodies.is_empty());
+    w.reply_text("a");
+    w.input("q1");
+    w.reply_text("<summary>S-MAN</summary>");
+    w.input("/compact  keep the parser notes ");
+    assert_eq!(w.bodies.len(), 2);
+    assert!(w.bodies[1].contains("pay particular attention to this: keep the parser notes\""), "{}", w.bodies[1]);
+    assert!(w.said("(compacting the conversation)"));
+    assert!(w.said("(compacted: 2 messages became a summary)"), "no file to mention: {:?}", w.says);
+    assert!(!w.g.busy(), "nothing goes to the model after a /compact");
+    w.input("/compact");
+    assert_eq!(w.says.last().unwrap().1, "Nothing to compact yet.", "a summary alone is not compacted again");
+    w.input("/compact at");
+    assert!(w.said("the conversation takes about 20 now"), "the summary's size, not the old 120: {:?}", w.says.last());
+    w.reply_text("b");
+    w.input("q2");
+    assert_eq!(msg_count(&w, 2), 1);
+    let t = w.last_user_text();
+    assert!(t.contains("S-MAN") && t.ends_with("|q2"), "{t}");
+
+    // the setting
+    w.input("/compact at");
+    assert!(w.said("Compaction: automatic compaction is off; the conversation takes about 120 now. /compact compacts it now"));
+    w.input("/compact at 200k");
+    assert!(w.said("Compaction: automatic once the conversation takes 200000 tokens."));
+    w.input("/compact at");
+    assert!(w.said("Compaction: automatic once the conversation takes 200000 tokens; the conversation takes about 120 now."));
+    for bad in ["/compact at lots", "/compact at 999"] {
+        w.input(bad);
+        let last = w.says.last().unwrap();
+        assert!(last.0 == Style::Error && last.1.starts_with("Unknown size ") && last.1.ends_with("The smallest is 1000."), "{last:?}");
+    }
+    w.input("/compact off");
+    assert!(w.said("Automatic compaction is off. /compact still compacts when you ask"));
+    w.input("/compact at");
+    assert!(w.says.last().unwrap().1.starts_with("Compaction: automatic compaction is off;"), "{:?}", w.says.last());
+    w.input("/compact at  5000 ");
+    assert_eq!(w.says.last().unwrap().1, "Compaction: automatic once the conversation takes 5000 tokens.");
+    w.input("/compact at off");
+    assert_eq!(w.says.last().unwrap().1, w.says[w.says.len() - 4].1, "at off is off");
+    w.input("/clear");
+    w.input("/compact at");
+    assert!(!w.says.last().unwrap().1.contains("takes about"), "a new conversation takes nothing yet");
+
+    // not while the model is asked
+    w.hold_http = true;
+    w.input("q3");
+    let n = w.bodies.len();
+    w.input("/compact");
+    assert!(w.said("Busy: wait for the current step, or press Ctrl-C, before /compact."));
+    assert_eq!(w.bodies.len(), n);
+}
+
+#[test]
+fn compacts_when_it_no_longer_fits() {
+    let mut cfg = compacting_at(150_000);
+    cfg.verbose = true;
+    let mut w = World::with(cfg);
+    let big = "x".repeat(20000);
+    w.procs.push(("cat", big.clone().into_bytes(), 0, 0));
+    let c = format!(
+        "[{{\"type\":\"thinking\",\"thinking\":\"hmm\",\"signature\":\"s\"}},{}]",
+        tool("t1", "bash", r#"{"command":"cat big"}"#)
+    );
+    w.reply(&mk_reply("tool_use", &c), 200);
+    w.reply_text("read it");
+    w.input("q1");
+    assert_eq!(w.bodies.len(), 2);
+    assert!(w.bodies[1].contains(&big[..10000]) && w.bodies[1].contains("\"thinking\":\"hmm\""));
+    w.reply(TOO_LONG, 400);
+    w.reply_text("<summary>S-OVER</summary>");
+    w.reply_text("fits now");
+    w.input("q2");
+    assert_eq!(w.bodies.len(), 5, "the request, the summary request, the request again");
+    assert!(w.said("(the conversation no longer fits the model's context window: compacting it)"));
+    assert!(!w.says.iter().any(|x| x.0 == Style::Error), "{:?}", w.says);
+    // the summary request is made smaller: long results cut, thinking left out
+    let s = &w.bodies[3];
+    assert!(!s.contains(&big[..5000]) && !s.contains("\"thinking\":\"hmm\""), "{s}");
+    assert!(s.contains("\"tool_use_id\":\"t1\"") && s.contains("q2"));
+    assert!(w.bodies[4].contains("S-OVER") && w.bodies[4].contains("\"text\":\"q2\""));
+    assert!(w.said("fits now"));
+    assert!(w.says.iter().any(|x| x == &(Style::Thinking, "S-OVER".to_string())), "verbose shows the summary");
+
+    // Too long even after compacting: said, and the request is not tried a third time.
+    w.reply(TOO_LONG, 400);
+    w.reply_text("<summary>S-2</summary>");
+    w.reply(TOO_LONG, 400);
+    w.input("q3");
+    assert_eq!(w.bodies.len(), 8);
+    assert!(w.said("API error (HTTP 400, invalid_request_error): prompt is too long"));
+    assert!(w.said("The message does not fit the model's context window: send less at a time."));
+    w.eof();
+    assert_eq!(w.exit_code, 1);
+
+    // The summary request does not fit either.
+    let mut w = World::with(compacting_at(150_000));
+    w.reply_text("a");
+    w.input("q1");
+    w.reply(TOO_LONG, 400);
+    w.reply(TOO_LONG, 400);
+    w.input("q2");
+    assert_eq!(w.bodies.len(), 3);
+    assert!(w.said("Could not compact the conversation: API error (HTTP 400, invalid_request_error): prompt is too long"));
+    assert!(w.said("The conversation no longer fits the model's context window. /clear starts over."));
+    assert!(!w.g.busy());
+
+    // Nothing to compact: the first message alone is too long.
+    let mut w = World::with(compacting_at(150_000));
+    w.reply(TOO_LONG, 400);
+    w.input("a huge paste");
+    assert_eq!(w.bodies.len(), 1);
+    assert!(w.said("send less at a time"));
+}
+
+#[test]
+fn a_failed_compaction() {
+    // Automatic: the request goes on without it, and no more tries until one works.
+    let mut w = World::with(compacting_at(1000));
+    w.reply(&mk_reply_tok("end_turn", &text_blocks("a"), 2000), 200);
+    w.input("q1");
+    w.reply_tools(&[tool("x", "bash", r#"{"command":"ls"}"#)]); // no summary, and the call is not run
+    w.reply(&mk_reply_tok("end_turn", &text_blocks("b"), 3000), 200);
+    w.input("q2");
+    assert_eq!(w.bodies.len(), 3);
+    assert!(w.said("Could not compact the conversation: the model wrote no summary"));
+    assert!(w.said("automatic compaction is paused until /compact works"));
+    assert!(w.ops.iter().all(|o| o.kind != Kind::Spawn));
+    assert_eq!(msg_count(&w, 2), 3, "unchanged, with q2");
+    w.reply_text("c");
+    w.input("q3");
+    assert_eq!(w.bodies.len(), 4, "paused");
+    w.input("/compact at");
+    assert!(w.said("(paused: the last try failed)"));
+    // a /compact that works ends the pause
+    w.reply_text("<summary>S</summary>");
+    w.input("/compact");
+    w.reply(&mk_reply_tok("end_turn", &text_blocks("d"), 3000), 200);
+    w.input("q4");
+    w.reply_text("<summary>S2</summary>");
+    w.reply_text("e");
+    w.input("q5");
+    assert_eq!(w.bodies.len(), 8, "compacting by itself again");
+    // and so does a new setting
+    let mut w = World::with(compacting_at(1000));
+    w.reply(&mk_reply_tok("end_turn", &text_blocks("a"), 2000), 200);
+    w.input("q1");
+    w.reply_tools(&[tool("x", "bash", r#"{"command":"ls"}"#)]);
+    w.reply(&mk_reply_tok("end_turn", &text_blocks("b"), 3000), 200);
+    w.input("q2");
+    w.input("/compact at 2000");
+    w.reply_text("<summary>S</summary>");
+    w.reply_text("c");
+    w.input("q3");
+    assert_eq!(w.bodies.len(), 5);
+
+    // By hand: the conversation is left as it was; a cut-off summary is no summary.
+    let mut w = World::new(true);
+    w.reply_text("a");
+    w.input("q1");
+    w.reply(&mk_reply("max_tokens", &text_blocks("<analysis>going on and on")), 200);
+    w.input("/compact");
+    assert!(w.said("Could not compact the conversation: the summary was cut off at the output token limit\nIt is unchanged."));
+    w.reply_text("b");
+    w.input("q2");
+    assert_eq!(msg_count(&w, 2), 3);
+    // a summary that is cut off inside its <summary> is used, and said to be cut
+    w.reply(&mk_reply("max_tokens", &text_blocks("<summary>most of it")), 200);
+    w.input("/compact");
+    assert!(w.said("(the summary was cut off at the output token limit: it may leave out the latest work)"));
+    w.reply_text("c");
+    w.input("q3");
+    assert!(w.last_body().contains("most of it"));
+}
+
+#[test]
+fn compaction_retries_and_interrupts() {
+    let mut w = World::with(compacting_at(1000));
+    w.reply(&mk_reply_tok("end_turn", &text_blocks("a"), 2000), 200);
+    w.input("q1");
+    // overloaded: the summary request is sent again, the same
+    w.reply(OVERLOADED, 529);
+    w.reply_text("<summary>S</summary>");
+    w.reply_text("b");
+    w.input("q2");
+    assert_eq!(w.bodies.len(), 2);
+    let t = w.last_op(Kind::Timer);
+    w.timer(t);
+    assert_eq!(w.bodies.len(), 4);
+    assert_eq!(w.bodies[1], w.bodies[2]);
+    assert!(w.said("b"));
+
+    // Ctrl-C while the summary is written: nothing changes, and the request it held is marked
+    let mut cfg = compacting_at(1000);
+    cfg.session = b"i.json".to_vec();
+    let mut w = World::with(cfg);
+    w.reply(&mk_reply_tok("end_turn", &text_blocks("a"), 2000), 200);
+    w.input("q1");
+    w.hold_http = true;
+    w.input("q2");
+    let id = w.last_op(Kind::Http);
+    assert!(w.g.busy());
+    w.interrupt();
+    assert!(w.said("Interrupted; the conversation was not compacted."));
+    assert!(w.op_of(id).cancelled && !w.g.busy());
+    assert_eq!(w.g.session_path(), b"i.json");
+    assert!(w.file("i.json").unwrap().contains("The user interrupted you here"));
+    w.hold_http = false;
+    w.reply_text("<summary>S</summary>");
+    w.reply_text("c");
+    w.input("q3");
+    let b = w.last_body();
+    assert!(b.contains("\"text\":\"q2\"") && b.contains("The user interrupted you here") && b.contains("\"text\":\"q3\""), "{b}");
+    // a late reply to the cancelled request changes nothing
+    let n = w.bodies.len();
+    w.http(id, 200, &mk_reply("end_turn", &text_blocks("<summary>LATE-ONE</summary>")));
+    assert_eq!(w.bodies.len(), n);
+    assert!(!w.last_body().contains("LATE-ONE"));
+
+    // ...and while it waits to try again
+    let mut w = World::with(compacting_at(1000));
+    w.reply(&mk_reply_tok("end_turn", &text_blocks("a"), 2000), 200);
+    w.input("q1");
+    w.reply(OVERLOADED, 529);
+    w.input("q2");
+    let t = w.last_op(Kind::Timer);
+    w.interrupt();
+    assert!(w.op_of(t).cancelled && !w.g.busy());
+    w.timer(t);
+    assert_eq!(w.bodies.len(), 2, "the cancelled timer sends nothing");
+
+    // /compact interrupted: nothing is added
+    let mut w = World::new(true);
+    w.reply_text("a");
+    w.input("q1");
+    w.hold_http = true;
+    w.input("/compact");
+    w.interrupt();
+    w.hold_http = false;
+    w.reply_text("b");
+    w.input("q2");
+    assert!(!w.last_body().contains("interrupted"), "{}", w.last_body());
 }

@@ -922,10 +922,50 @@ def test_sessions():
     fake.stop()
 
 
+def test_compaction():
+    d = tempfile.mkdtemp()
+    sd = os.path.join(d, ".barb", "sessions")
+    big = text("one")
+    big["usage"]["input_tokens"] = 1200
+    def summary(req):
+        last = req["messages"][-1]["content"][-1]
+        ok = last["type"] == "text" and last["text"].startswith("[barb] Stop the task here.")
+        if not ok: fake.problems.append(f"not a summary request: {last}")
+        return text("<analysis>scratch</analysis><summary>The user said first; nothing else.</summary>")
+    fake = Fake([big, summary, text("two"), text("three")])
+    p, _ = run(fake, ["-p", "x", "--compact-at", "lots", "--no-save"], d)
+    check(p.returncode == 2 and "bad compaction point" in p.stderr and "200k" in p.stderr, f"bad --compact-at: {p.returncode} {p.stderr!r}")
+    env = env_for(fake)
+    env["BARB_COMPACT_AT"] = "1k"
+    p = subprocess.run([BARB, "--yes"], cwd=d, env=env, input="first\nsecond\n/compact at\n", capture_output=True, **TEXT, timeout=60)
+    check(p.returncode == 0, f"exit {p.returncode}: {p.stderr}")
+    check(len(fake.requests) == 3, f"{len(fake.requests)} requests")
+    if len(fake.requests) == 3:
+        msgs = fake.requests[2]["messages"]
+        check(len(msgs) == 1 and "The user said first" in msgs[0]["content"][0]["text"], f"compacted: {msgs}")
+        check(msgs[0]["content"][-1].get("text") == "second", f"what the user said last follows the summary as typed: {msgs}")
+        check("scratch" not in json.dumps(msgs), "the analysis is dropped")
+    check("two" in p.stdout and "(compacted: 3 messages became a summary; the whole conversation is still in" in p.stderr, f"{p.stderr!r}")
+    check("automatic once the conversation takes 1000 tokens" in p.stderr, f"BARB_COMPACT_AT: {p.stderr!r}")
+    files = sorted(os.listdir(sd), key=len) if os.path.isdir(sd) else []
+    check(len(files) == 2 and files[1] == files[0][:-5] + "-2.json", f"the whole conversation and the compacted one: {files}")
+    if len(files) == 2:
+        whole = json.load(open(os.path.join(sd, files[0]), encoding="utf-8"))["messages"]
+        check(len(whole) == 3 and whole[0]["content"][0]["text"] == "first", f"the whole conversation is kept: {whole}")
+        # -c takes up the compacted one; --compact-at off makes no difference to a small one
+        p, _ = run(fake, ["-c", "-p", "third", "--compact-at", "off"], d)
+        r = fake.requests[-1]["messages"]
+        check(p.returncode == 0 and p.stdout == "three\n" and "The user said first" in r[0]["content"][0]["text"] and len(r) == 3,
+              f"-c after compacting: {p.returncode} {p.stderr!r}")
+    no_problems(fake, "compaction")
+    fake.stop()
+
+
 if __name__ == "__main__":
     for t in (test_startup_errors, test_files_and_bash, test_key_not_inherited, test_background_wake, test_timeout_and_interrupt,
               test_leftovers_killed, test_permissions_and_errors, test_interactive_pipe, test_interactive_interrupt, test_interactive_permissions,
-              test_one_key_typeahead, test_line_editing, test_paste, test_suspend, test_instructions, test_effort, test_sessions):
+              test_one_key_typeahead, test_line_editing, test_paste, test_suspend, test_instructions, test_effort, test_sessions,
+              test_compaction):
         t()
     print(f"e2e: {checks} checks, {failed} failed")
     sys.exit(1 if failed else 0)

@@ -65,7 +65,8 @@ is limited.)
 | `core/src/text.rs` | byte strings and the `cat!` macro | through everything else |
 | `core/src/json.rs` | validating pull reader, lookups, UTF-8-safe writer | `core/tests/json.rs` (corpus, UTF-8 cases, fuzz mutations) |
 | `core/src/api.rs` | transcript, request body, reply parsing, the saved-conversation format and its repair | `core/tests/api.rs` |
-| `core/src/agent.rs` | the state machine: turns, retries, interrupts, background tasks, instructions, saving and resuming | `core/tests/agent.rs` (scenarios, chaos) |
+| `core/src/agent.rs` | the state machine: turns, retries, interrupts, background tasks, instructions, saving and resuming, compaction | `core/tests/agent.rs` (scenarios, chaos) |
+| `core/src/compact.rs` | compaction's plain parts: the summary prompt, reading the summary out of a reply, the message that replaces the conversation, trimming, the size setting | unit tests there, `core/tests/agent.rs` |
 | `core/src/tools.rs` | the six tools and their definitions | `core/tests/agent.rs` |
 | `ui/src/edit.rs` | the prompt's line editor: no I/O, it returns the bytes to draw | `ui/tests/edit.rs` (a terminal emulator, both wrapping modes, random keys) |
 | `ui/src/keys.rs` | turns a terminal's bytes into keys: escape sequences, UTF-8, bracketed paste; the caller times out a lone Escape | `ui/tests/keys.rs` |
@@ -143,7 +144,7 @@ core saves with ordinary `Write` actions (atomic, parent directories made): when
 (not a retry), when a reply is added, and after an interrupt changes the transcript. It keeps the
 ids of its own writes, so their `File` events go to `on_saved` and not to a tool; a failure is said
 once. The platform decides the path (`common::plan`: a new name, `-c`, `-r`) and hands it over in
-`Config::session`; after `/clear` the agent moves to the `-2`, `-3`, ... sibling itself.
+`Config::session`; after `/clear` or a compaction the agent moves to the `-2`, `-3`, ... sibling itself.
 
 `Agent::resume(data, show)` comes before any event. It loads and repairs the transcript
 (`Transcript::repair`: a `tool_result` for every call that never got one), shows the last messages
@@ -171,6 +172,32 @@ and switching it mid-conversation spoils the message cache for one request. Chan
 mid-conversation is safe on the Claude API (thinking blocks a model cannot read are dropped, not
 refused); other providers' blocks carry no Claude signature, so going from one to the other is
 untested.
+
+## Compaction
+
+The agent keeps `ctx_tokens`, what the last reply said the conversation takes (input, cached and
+written, plus output). When a request is about to go out and that is past `Config::compact_at`
+(0 is off; the platform passes `compact::DEFAULT_COMPACT_AT` or `--compact-at`/`$BARB_COMPACT_AT`),
+`begin_compact` sends a summary request instead and holds the real one back (`State::Compact`).
+The summary request is the conversation as it is, built with the same `api_cfg` as any request so
+the cached prefix still counts, with `compact::instruction` added as text to the last user message.
+The summary (what is inside `<summary>`) then becomes the whole transcript: one user message, the
+`compact::summary_message`, followed by the trailing text blocks of the last user message if they
+were unanswered (what the user just typed, word for word). Then the held request goes out.
+
+Nothing older is kept verbatim. That is deliberate: a tail of recent turns would mean sending
+earlier assistant turns again after a changed prefix, and their thinking blocks would fail the
+API's check, or a `tool_use` would be cut from its result. A summary-only transcript has neither
+problem. It also cannot be compacted again until something is added, which is what stops the
+overflow path from looping: when the API refuses a request as too long (`compact::is_overflow`),
+the agent compacts once, from a `compact::trimmed` copy (no thinking, long results and inputs cut),
+and resends; a second refusal is an error.
+
+`/compact [FOCUS]` does it by hand (the focus is added to the instruction), and nothing goes to the
+model after it. A failed automatic compaction says so and sends the held request anyway, with
+automatic compaction paused until one works or the setting changes. Ctrl-C during the summary
+request, or its retry wait, leaves the conversation as it was. With saving on, `parts` moves on as
+for `/clear`, so the file before the compaction keeps the whole conversation.
 
 ## Sleeping and waking
 

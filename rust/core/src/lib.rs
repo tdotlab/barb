@@ -10,4 +10,5 @@ pub mod text;
 pub mod api;
 pub mod json;
 pub mod agent;
+pub mod compact;
 pub mod tools;

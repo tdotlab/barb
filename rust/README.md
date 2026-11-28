@@ -29,7 +29,8 @@ target/release/barb -p "fix the failing test in tests/foo.c" --yes
 
 Options: `-p TASK` (do one task and exit; `-` reads it from standard input), `-m MODEL` (default
 `claude-sonnet-5-5`, or `$BARB_MODEL`), `--effort LEVEL` (`low`, `medium`, `high`, `xhigh` or
-`max`, or `$BARB_EFFORT`; unset, the model's default), `-y/--yes` (do not ask before writing files
+`max`, or `$BARB_EFFORT`; unset, the model's default), `--compact-at N` (when to compact the
+conversation, below), `-y/--yes` (do not ask before writing files
 or running commands), `-C DIR`, `--max-turns N` (model calls per message without you typing;
 default 60).
 `ANTHROPIC_BASE_URL` points it at another endpoint (the tests use a fake one on localhost).
@@ -52,6 +53,16 @@ In a session, `/clear` forgets the conversation (a saved one stays saved; what f
 new file), `/model NAME` and `/effort LEVEL` change the model and the effort from the next request
 (alone, they say what is set; `/effort default` goes back to the model's), `/exit` or Ctrl-D quits, and Ctrl-C stops what is running (twice at the prompt quits); the model is told it was interrupted. Type while it works
 and your message is queued.
+
+Long conversations are compacted: once one takes 150,000 tokens, Barb has the model write a
+summary of it before the next request, and the summary takes its place (what you said last follows
+it word for word). `/compact` does it now, and `/compact keep the parser notes` tells the summary
+what to keep in view. `/compact at 300k` sets when it happens by itself, `/compact off` stops that,
+and `/compact at` says what is set and how big the conversation is. To set it for a machine, use
+`--compact-at N` or `$BARB_COMPACT_AT` (`200000`, `200k`, `1m` or `off`). If the API says a
+request no longer fits the model's window anyway (a model with a smaller one than the setting
+assumes), Barb compacts and sends it again, once. With saving on, the whole conversation stays in
+its file and the compacted one goes on in the next (`NAME-2.json`), so nothing is lost.
 
 On a terminal the prompt sits in a small block at the bottom: a line above it says what is going
 on (a spinner while the model thinks or a command runs, with the seconds; the retry countdown after
@@ -142,7 +153,7 @@ then the release binary end to end.
 - `core/tests/api.rs`: the request body, reply parsing, and saved conversations (the format and
   the repair of a cut-off one);
 - `core/tests/agent.rs`: scenarios for every tool and error path, interrupts in every state,
-  saving and resuming, and a randomized chaos test of event orders (which also resumes whatever
+  saving and resuming, compaction, and a randomized chaos test of event orders (which also resumes whatever
   was last saved, at whatever point that was). A fake model and a fake world run the whole agent, and
   every request it builds is checked against the rules the API enforces (see ARCHITECTURE.md);
 - `ui/tests/edit.rs`: the line editor, played on a terminal emulator in both of the console's
@@ -164,13 +175,15 @@ then the release binary end to end.
 
 `tools/mutate.py` breaks the code on purpose in listed ways and checks that a test fails each
 time; every mutation in its table is caught, on Linux and on Windows (it runs the ones for the
-system it is on). Not tested: macOS, and sessions long enough to fill the context window.
+system it is on). Not tested: macOS, and compaction against a live model (the fake one writes
+the summaries).
 
 ## Limits
 
 - Replies are not streamed: you see the answer when it is complete.
-- No compaction: when the conversation outgrows the model's context window, the API says so and
-  you `/clear`.
+- Compaction is one setting for every model; it does not yet know each model's window (that wants
+  a settings file). Set it below the smallest window you use, or rely on the compact-and-retry when
+  a request does not fit.
 - A command that is not run in the background is killed, with its children, when it ends or after
   its timeout (default 2 minutes, at most 10). Background tasks are killed when Barb exits.
 - `edit_file` and `write_file` follow symbolic links and write atomically, but do not keep file

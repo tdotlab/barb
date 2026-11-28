@@ -37,6 +37,7 @@ version's `ARCHITECTURE.md` describes its own code, and the two read nearly alik
 | `unsafe` | all of it, by nature | only in the platform modules, each block with a `SAFETY` comment; `core` and `ui` forbid it |
 | Saved conversations, verbose | not yet | `-c`, `-r`, `--sessions`; `-v`, `/verbose` |
 | Model and effort in a session | `-m` at startup only | `/model`, `/effort`, `--effort` |
+| Compaction | none: the API's error says to `/clear` | automatic past `--compact-at` (150k), `/compact`, and once more when a request does not fit |
 | Size | about 8,200 lines | about 11,700 lines, many of them tests in the same files as the code |
 
 ## The port, briefly

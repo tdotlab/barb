@@ -8,8 +8,13 @@ it bumps the version number below.
 
 `.barb/sessions/` in the working directory, one file per conversation, named for when it started
 in local time: `YYYYMMDD-HHMMSS.json`. If that name is taken, `-b`, `-c`, ... `-z` go after it.
-After `/clear` the conversation goes on in a new file next to the old one, `<stem>-2.json`, then
-`-3`, so nothing saved is overwritten by what comes after it.
+After `/clear` or a compaction the conversation goes on in a new file next to the old one,
+`<stem>-2.json`, then `-3`, so nothing saved is overwritten by what comes after it. A compacted
+conversation's file starts with one user message whose first text block begins
+`[barb] This conversation was compacted` and holds the summary inside `<summary>`...`</summary>`;
+a version that knows it shows a line saying so on resume instead of the text, and one that does
+not shows nothing (it is a `[barb]` line). The whole conversation before it is still in the file
+before it.
 
 When the first conversation is saved, `.barb/.gitignore` is written with `*` in it (if there is no
 such file yet), so the saved conversations stay out of the project's git. Barb's background task

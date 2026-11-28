@@ -19,6 +19,11 @@ the resume note. The Rust tests (`core/tests/agent.rs`, the `test_sessions` part
 **Verbose, in C.** Rust has `-v` and `/verbose`: thinking blocks shown dim and italic, hidden by
 default, and shown again on resume. Sonnet medium.
 
+**Compaction, in C.** T asked for it there. Rust's `core/src/compact.rs` (the prompt, reading the
+summary, the trimming) and the compaction part of `core/src/agent.rs` are the design; its tests
+(the `compact` scenarios in `core/tests/agent.rs`, `test_compaction` in `rust/tests/e2e.py`) are the
+checklist. Needs saved sessions in C first, for the `-2` file. Opus high, Codex Sol high.
+
 **The port's fixes, in C.** The Rust port found three things the C version still has: the
 plain-http warning matches `http://localhost.evil.com` as local (parse the host), the atomic-write
 test looks for leftovers in the wrong directory, and no end-to-end test checks that a foreground
@@ -32,12 +37,14 @@ A server-sent-events parser in the core (host-tested against recorded streams), 
 accumulated as JSON, and the platforms' `http` passing curl's output through in pieces (an `Event::HttpChunk`).
 The design is the hard part. Opus high, Codex Sol high.
 
-**Compaction.** When `usage.input_tokens` nears the window, summarize the old part of the
-conversation (a model call with no tools) and replace it, keeping recent turns whole. The transcript
-is a plain `Vec` now, so dropping the old part frees it. Opus high, Codex Sol high.
-
 **Permissions you can set.** A settings file (`.barb/settings.json`) with allow and deny lists, so
-`git status` and the test command do not ask every time. Sonnet high.
+`git status` and the test command do not ask every time. The same file is where a compaction point
+per model belongs (`"compact_at": {"deepseek-flash": "100k"}`), over `--compact-at` and
+`$BARB_COMPACT_AT`, which are one number for every model now. Sonnet high.
+
+**Compaction, live.** It is tested against the fake API only. One long real session that crosses
+the point, on Claude and on DeepSeek, to see the summary hold up and the cache survive the summary
+request. Sonnet medium.
 
 **More tools.** `glob` and `grep` as tools (the model can use bash, but a dedicated tool has bounded,
 sorted output), and `list_dir`. Sonnet high, Codex Luna high.

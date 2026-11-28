@@ -82,6 +82,7 @@ pub struct Args {
     pub sessions: bool,
     pub verbose: bool,
     pub effort: Option<OsString>,
+    pub compact_at: Option<OsString>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -132,6 +133,9 @@ pub fn parse(argv: &[OsString]) -> Parsed {
         } else if is("--effort") && val.is_some() {
             a.effort = val;
             i += 1;
+        } else if is("--compact-at") && val.is_some() {
+            a.compact_at = val;
+            i += 1;
         } else if is("--max-turns") && val.is_some() {
             a.max_turns = atoi(&val.unwrap().to_string_lossy());
             i += 1;
@@ -152,6 +156,23 @@ pub fn effort(a: &Args, env: Option<OsString>) -> Result<Vec<u8>, String> {
     } else {
         Err(format!("unknown effort {:?}: use one of {}", v, barb_core::api::EFFORTS.join(", ")))
     }
+}
+
+/// When to compact by itself: --compact-at, else `env` ($BARB_COMPACT_AT), else the default. A
+/// token count ("200000", "200k", "1m") or "off"; an empty variable counts as unset.
+pub fn compact_at(a: &Args, env: Option<OsString>) -> Result<i64, String> {
+    let env = env.filter(|v| !v.is_empty());
+    let Some(v) = a.compact_at.clone().or(env) else {
+        return Ok(barb_core::compact::DEFAULT_COMPACT_AT);
+    };
+    let v = v.to_string_lossy().into_owned();
+    barb_core::compact::parse_compact_at(v.as_bytes()).ok_or_else(|| {
+        format!(
+            "bad compaction point {:?}: give a token count such as 200000 or 200k (at least {}), or off",
+            v,
+            barb_core::compact::MIN_COMPACT_AT
+        )
+    })
 }
 
 /// As C's atoi: leading blanks, a sign, digits; 0 when there are none.
@@ -582,6 +603,24 @@ mod tests {
         let e = effort(&run(&["--effort", "hgih"]), None).unwrap_err();
         assert!(e.contains("\"hgih\"") && e.contains("low, medium, high, xhigh, max"), "{}", e);
         assert!(effort(&run(&[]), Some("HIGH".into())).is_err(), "levels are lower case");
+    }
+
+    #[test]
+    fn compact_option() {
+        let run = |v: &[&str]| match parse(&os(v)) {
+            Parsed::Run(a) => a,
+            p => panic!("{:?}", p),
+        };
+        assert_eq!(parse(&os(&["--compact-at"])), Parsed::Bad("--compact-at".into()), "a value is needed");
+        assert_eq!(compact_at(&run(&[]), None), Ok(150_000), "the default");
+        assert_eq!(compact_at(&run(&["--compact-at", "300k"]), None), Ok(300_000));
+        assert_eq!(compact_at(&run(&["--compact-at", "off"]), None), Ok(0));
+        assert_eq!(compact_at(&run(&[]), Some("80000".into())), Ok(80_000), "from the environment");
+        assert_eq!(compact_at(&run(&["--compact-at", "1m"]), Some("off".into())), Ok(1_000_000), "the option wins");
+        assert_eq!(compact_at(&run(&[]), Some("".into())), Ok(150_000), "an empty variable is unset");
+        let e = compact_at(&run(&["--compact-at", "lots"]), None).unwrap_err();
+        assert!(e.contains("\"lots\"") && e.contains("200k") && e.contains("off"), "{}", e);
+        assert!(compact_at(&run(&[]), Some("12".into())).is_err(), "too small");
     }
 
     #[test]

@@ -22,7 +22,8 @@
 //!
 //! The tools are in tools.rs.
 
-use crate::api::{self, Block, Reply, Transcript};
+use crate::api::{self, Block, Msg, Reply, Transcript};
+use crate::compact;
 use crate::json;
 use crate::text::{self, Bytes};
 use crate::tools::{self, Tc};
@@ -147,12 +148,16 @@ pub struct Config {
     /// with the files its "@file" lines name, into the system prompt.
     pub instructions: bool,
     /// Save the conversation to this file (see docs/SESSIONS.md) each time it changes; empty for
-    /// not at all. After /clear it goes on in "<name>-2.json", "-3", and so on.
+    /// not at all. After /clear or a compaction it goes on in "<name>-2.json", "-3", and so on.
     pub session: Bytes,
     /// Show the model's thinking (Style::Thinking). /verbose turns it on and off.
     pub verbose: bool,
     /// One of api::EFFORTS, or empty for the model's default. /effort changes it.
     pub effort: Bytes,
+    /// Compact the conversation before a request once it takes this many tokens, and when the API
+    /// says it no longer fits; 0 for neither (/compact still works). A platform passes
+    /// compact::DEFAULT_COMPACT_AT unless the user says otherwise. /compact at N changes it.
+    pub compact_at: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,6 +167,27 @@ pub(crate) enum State {
     Retry,
     Tools,
     Load,
+    /// The summary request of a compaction is in flight.
+    Compact,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Why {
+    /// The conversation passed compact_at; the request it held back goes out after.
+    Auto,
+    /// /compact.
+    Manual,
+    /// The API said the request no longer fits; it goes out again after.
+    Overflow,
+}
+
+/// A compaction under way.
+struct Compact {
+    why: Why,
+    /// The summary request, kept for retries.
+    body: Bytes,
+    /// The user's newest words, not yet answered: they follow the summary verbatim.
+    held: Vec<Block>,
 }
 
 pub(crate) struct Call {
@@ -259,13 +285,20 @@ pub struct Agent {
     /// The last model call ended in an API error (the exit status when we finish).
     failed: bool,
 
-    /// Saves in flight; whether a failed one has been reported; how many times /clear has started
-    /// a new file.
+    /// Saves in flight; whether a failed one has been reported; how many times /clear or a
+    /// compaction has started a new file.
     save_ops: Vec<i64>,
     save_warned: bool,
-    clears: u32,
+    parts: u32,
     /// Said to the model at the start of the next user message, after a resume.
     resume_note: Bytes,
+
+    /// The compaction under way.
+    cp: Option<Compact>,
+    /// What the conversation took at the last reply, in tokens (0: not known yet).
+    ctx_tokens: i64,
+    /// An automatic compaction failed: no more until /compact works or the setting changes.
+    auto_paused: bool,
 
     acts: Vec<Action>,
 }
@@ -274,8 +307,10 @@ pub struct Agent {
 const REPLAY_MSGS: usize = 40;
 
 /// What the prompt takes as a command, whatever follows it.
-const COMMANDS: [&[u8]; 7] = [b"/exit", b"/quit", b"/clear", b"/help", b"/verbose", b"/model", b"/effort"];
+const COMMANDS: [&[u8]; 8] = [b"/exit", b"/quit", b"/clear", b"/help", b"/verbose", b"/model", b"/effort", b"/compact"];
 const EFFORT_HELP: &str = "/effort LEVEL sets it: low, medium, high, xhigh or max; /effort default goes back.";
+const COMPACT_HELP: &str = "/compact compacts it now (add what the summary should keep in view, if you like); \
+    /compact at N sets when it happens by itself, as a token count such as 200000 or 200k; /compact off stops that.";
 
 /// The "@path" line `line`, or None.
 fn import_of(line: &[u8]) -> Option<&[u8]> {
@@ -345,8 +380,11 @@ impl Agent {
             failed: false,
             save_ops: Vec::new(),
             save_warned: false,
-            clears: 0,
+            parts: 0,
             resume_note: Vec::new(),
+            cp: None,
+            ctx_tokens: 0,
+            auto_paused: false,
             acts: Vec::new(),
         };
         g.system = g.build_system();
@@ -414,7 +452,9 @@ impl Agent {
             for b in &m.blocks {
                 match b {
                     Block::Text(t) if !m.assistant => {
-                        if !t.starts_with(b"[barb]") {
+                        if t.starts_with(compact::MARK) {
+                            self.say(Style::Info, "(the earlier part of this conversation was compacted into a summary)");
+                        } else if !t.starts_with(b"[barb]") {
                             self.say(Style::User, t.clone());
                         }
                     }
@@ -451,15 +491,15 @@ impl Agent {
 
     // ---- saving the conversation ----
 
-    /// The file this conversation is saved to now: the configured one, or after /clear its
-    /// "-2", "-3", ... sibling.
+    /// The file this conversation is saved to now: the configured one, or after /clear or a
+    /// compaction its "-2", "-3", ... sibling.
     pub fn session_path(&self) -> Bytes {
         let p = &self.cfg.session;
-        if self.clears == 0 || p.is_empty() {
+        if self.parts == 0 || p.is_empty() {
             return p.clone();
         }
         let stem = p.strip_suffix(b".json").unwrap_or(p);
-        cat!(stem, "-", self.clears + 1, ".json")
+        cat!(stem, "-", self.parts + 1, ".json")
     }
 
     fn save(&mut self) {
@@ -594,8 +634,10 @@ impl Agent {
 
     // ---- asking the model ----
 
-    fn post_request(&mut self) {
-        let cfg = api::Cfg {
+    /// What every request is sent with. A summary request uses the same, so that it starts with
+    /// what the last request sent and the prompt cache covers it.
+    fn api_cfg(&self) -> api::Cfg<'_> {
+        api::Cfg {
             model: &self.cfg.model,
             max_tokens: self.cfg.max_tokens,
             effort: &self.cfg.effort,
@@ -604,8 +646,11 @@ impl Agent {
             thinking: self.cfg.verbose || !self.cfg.effort.is_empty(),
             system: &self.system,
             tools: tools::TOOLS_JSON.as_bytes(),
-        };
-        let body = api::request(&cfg, &self.tr);
+        }
+    }
+
+    fn post_request(&mut self) {
+        let body = api::request(&self.api_cfg(), &self.tr);
         let id = self.new_id();
         self.http_id = id;
         self.emit(Action::Http { id, path: "/v1/messages", body });
@@ -630,7 +675,175 @@ impl Agent {
         self.retries = 0;
         self.wait_said = false;
         self.save();
+        let at = self.cfg.compact_at;
+        if at > 0 && !self.auto_paused && self.ctx_tokens >= at && self.begin_compact(Why::Auto, b"") {
+            return; // the request goes out once the conversation is compacted
+        }
         self.post_request();
+    }
+
+    // ---- compaction (see compact.rs) ----
+
+    /// Start compacting; false if there is nothing to compact (the conversation is no more than
+    /// the user's newest words).
+    fn begin_compact(&mut self, why: Why, focus: &[u8]) -> bool {
+        // The text at the end of the last user message has not been answered yet: it is in the
+        // summary request, and it follows the summary verbatim too, so nothing the user just
+        // said is left to a paraphrase.
+        let held: Vec<Block> = match self.tr.msgs.last() {
+            Some(m) if !m.assistant => {
+                let from = m.blocks.iter().rposition(|b| !matches!(b, Block::Text(_))).map_or(0, |i| i + 1);
+                m.blocks[from..].to_vec()
+            }
+            _ => Vec::new(),
+        };
+        let only_held = self.tr.msgs.len() == 1 && held.len() == self.tr.msgs[0].blocks.len();
+        if self.tr.msgs.is_empty() || only_held {
+            return false;
+        }
+        let t = match why {
+            Why::Auto => cat!(
+                "(compacting the conversation: it takes ",
+                self.ctx_tokens,
+                " tokens, past the ",
+                self.cfg.compact_at,
+                " set for it)"
+            ),
+            Why::Manual => cat!("(compacting the conversation)"),
+            Why::Overflow => cat!("(the conversation no longer fits the model's context window: compacting it)"),
+        };
+        self.say(Style::Info, t);
+        // After an overflow the conversation as it is does not fit either: send less of it.
+        let mut tr = if why == Why::Overflow { compact::trimmed(&self.tr) } else { self.tr.clone() };
+        tr.user_msg().add_text(&compact::instruction(focus));
+        let body = api::request(&self.api_cfg(), &tr);
+        self.cp = Some(Compact { why, body, held });
+        self.retries = 0;
+        self.send_compact();
+        true
+    }
+
+    fn send_compact(&mut self) {
+        let Some(cp) = &self.cp else { return };
+        let body = cp.body.clone();
+        let id = self.new_id();
+        self.http_id = id;
+        self.emit(Action::Http { id, path: "/v1/messages", body });
+        self.state = State::Compact;
+    }
+
+    /// The summary came: it takes the conversation's place.
+    fn compact_done(&mut self, r: api::Message) {
+        let mut reply = Bytes::new();
+        for b in &r.msg.blocks {
+            if let Block::Text(t) = b {
+                push!(reply; t, "\n");
+            }
+        }
+        let summary = compact::extract(&reply);
+        let cut = r.stop_reason == b"max_tokens";
+        if summary.is_empty() {
+            self.compact_failed(if cut { "the summary was cut off at the output token limit" } else { "the model wrote no summary" }.into());
+            return;
+        }
+        let Some(cp) = self.cp.take() else { return };
+        let t = cat!("[tokens: ", r.in_tok + r.cache_read + r.cache_write, " in, ", r.out_tok, " out, for the summary]");
+        // What the conversation takes now: about the summary's length.
+        self.ctx_tokens = r.out_tok;
+        self.emit(Action::Say { style: Style::Usage, text: t, tokens: r.out_tok });
+        if self.cfg.verbose {
+            self.say(Style::Thinking, summary.clone());
+        }
+        let n = self.tr.msgs.len();
+        let old = self.session_path();
+        if !self.cfg.session.is_empty() {
+            self.parts += 1; // the whole conversation stays in the file it was in
+        }
+        let mut m = Msg { assistant: false, blocks: alloc::vec![Block::Text(compact::summary_message(&summary))] };
+        m.blocks.extend(cp.held);
+        self.tr.msgs = alloc::vec![m];
+        self.auto_paused = false;
+        self.state = State::Idle;
+        self.save();
+        let mut t = cat!("(compacted: ", n, " messages became a summary");
+        if !self.cfg.session.is_empty() {
+            push!(t; "; the whole conversation is still in ", old);
+        }
+        push!(t; ")");
+        self.say(Style::Info, t);
+        if cut {
+            self.say(Style::Info, "(the summary was cut off at the output token limit: it may leave out the latest work)");
+        }
+        if cp.why != Why::Manual {
+            self.post_request();
+        }
+    }
+
+    /// The summary request failed (`reason` says how); the conversation stays as it was.
+    fn compact_failed(&mut self, reason: Bytes) {
+        let Some(cp) = self.cp.take() else { return };
+        self.state = State::Idle;
+        let mut b = cat!("Could not compact the conversation: ", reason);
+        match cp.why {
+            Why::Manual => {
+                push!(b; "\nIt is unchanged.");
+                self.say(Style::Error, b);
+            }
+            Why::Auto => {
+                // Do not try again on every request: each try costs a request.
+                self.auto_paused = true;
+                push!(b; "\nGoing on without it; automatic compaction is paused until /compact works.");
+                self.say(Style::Error, b);
+                self.post_request();
+            }
+            Why::Overflow => {
+                push!(b; "\nThe conversation no longer fits the model's context window. /clear starts over.");
+                self.say(Style::Error, b);
+                self.failed = true;
+            }
+        }
+    }
+
+    /// The user stopped a compaction: the conversation stays as it was.
+    fn stop_compact(&mut self, op: i64) {
+        self.emit(Action::Cancel { id: op });
+        self.http_id = 0;
+        self.state = State::Idle;
+        let Some(cp) = self.cp.take() else { return };
+        if cp.why != Why::Manual {
+            // A request was waiting on it, as if it had gone to the model: say so, as then.
+            self.tr.user_msg().add_text(b"[barb] The user interrupted you here, before you replied.");
+            self.save();
+        }
+        self.say(Style::Info, "Interrupted; the conversation was not compacted.");
+    }
+
+    fn compact_command(&mut self, focus: &[u8]) {
+        if self.state != State::Idle {
+            self.say(Style::Error, "Busy: wait for the current step, or press Ctrl-C, before /compact.");
+        } else if !self.begin_compact(Why::Manual, focus) {
+            self.say(Style::Info, "Nothing to compact yet.");
+        }
+    }
+
+    fn compact_setting(&mut self, arg: &[u8]) {
+        let t = match compact::parse_compact_at(arg) {
+            Some(0) => {
+                self.cfg.compact_at = 0;
+                cat!("Automatic compaction is off. /compact still compacts when you ask; /compact at N turns it back on.")
+            }
+            Some(n) => {
+                self.cfg.compact_at = n;
+                self.auto_paused = false;
+                cat!("Compaction: automatic once the conversation takes ", n, " tokens.")
+            }
+            None => {
+                let t = cat!("Unknown size ", arg, ". ", COMPACT_HELP, " The smallest is ", compact::MIN_COMPACT_AT, ".");
+                self.say(Style::Error, t);
+                return;
+            }
+        };
+        self.say(Style::Info, t);
     }
 
     // ---- the project's instructions ----
@@ -850,9 +1063,10 @@ impl Agent {
 
     // ---- the model's reply ----
 
-    fn say_api_error(&mut self, status: i32, err: Option<(Bytes, Bytes)>, body: &[u8]) {
+    /// What to tell the user about an API error.
+    fn api_error(status: i32, err: &Option<(Bytes, Bytes)>, body: &[u8]) -> Bytes {
         let mut b = cat!("API error (HTTP ", status);
-        match &err {
+        match err {
             Some((kind, msg)) => {
                 if !kind.is_empty() {
                     push!(b; ", ", kind);
@@ -867,14 +1081,11 @@ impl Agent {
         if status == 401 || status == 403 {
             push!(b; "\nCheck ANTHROPIC_API_KEY.");
         }
-        if err.is_some_and(|(_, m)| text::contains(&m, b"too long")) {
-            push!(b; "\nThe conversation no longer fits the model's context window. Use /clear to start over.");
-        }
-        self.say(Style::Error, b);
+        b
     }
 
     fn on_http(&mut self, id: i64, st: i32, body: &[u8], note: &[u8]) {
-        if self.state != State::Model || id != self.http_id {
+        if !matches!(self.state, State::Model | State::Compact) || id != self.http_id {
             return; // stale: we cancelled it
         }
         self.http_id = 0;
@@ -905,6 +1116,10 @@ impl Agent {
                 if !note.is_empty() {
                     push!(b; ": ", note);
                 }
+                if self.cp.is_some() {
+                    self.compact_failed(b);
+                    return;
+                }
                 self.say(Style::Error, b);
                 self.state = State::Idle;
                 self.failed = true;
@@ -919,12 +1134,35 @@ impl Agent {
                     Some(Reply::Error { kind, message }) => Some((kind, message)),
                     _ => None,
                 };
-                self.say_api_error(st, err, body);
+                if self.cp.is_some() {
+                    let b = Self::api_error(st, &err, body);
+                    self.compact_failed(b);
+                    return;
+                }
+                let overflow = err.as_ref().is_some_and(|(_, m)| compact::is_overflow(m));
+                // Once: a compacted conversation is one message of text, which is not compacted again.
+                if overflow && self.cfg.compact_at > 0 && self.begin_compact(Why::Overflow, b"") {
+                    return; // the request goes out again once the conversation is compacted
+                }
+                let mut b = Self::api_error(st, &err, body);
+                if overflow && self.tr.msgs.len() > 1 {
+                    push!(b; "\nThe conversation no longer fits the model's context window. ",
+                        "/compact summarizes it to make room; /clear starts over.");
+                } else if overflow {
+                    // Nothing before it to compact (or that was done already): the newest
+                    // message is what does not fit.
+                    push!(b; "\nThe message does not fit the model's context window: send less at a time.");
+                }
+                self.say(Style::Error, b);
                 self.state = State::Idle;
                 self.failed = true;
                 return;
             }
         };
+        if self.cp.is_some() {
+            self.compact_done(r);
+            return;
+        }
         self.failed = false;
 
         let mut calls = Vec::new();
@@ -949,6 +1187,7 @@ impl Agent {
             push!(u; " (", r.cache_read, " cached)");
         }
         push!(u; ", ", r.out_tok, " out]");
+        self.ctx_tokens = total + r.out_tok;
         self.emit(Action::Say { style: Style::Usage, text: u, tokens: total + r.out_tok });
         if !r.msg.blocks.is_empty() {
             self.tr.msgs.push(r.msg);
@@ -1038,6 +1277,24 @@ impl Agent {
                 let t = cat!("Unknown effort ", level, ". ", EFFORT_HELP);
                 self.say(Style::Error, t);
             }
+            (b"/compact", b"at") => {
+                let mut t = if self.cfg.compact_at > 0 {
+                    cat!("Compaction: automatic once the conversation takes ", self.cfg.compact_at, " tokens")
+                } else {
+                    cat!("Compaction: automatic compaction is off")
+                };
+                if self.auto_paused && self.cfg.compact_at > 0 {
+                    push!(t; " (paused: the last try failed)");
+                }
+                if self.ctx_tokens > 0 {
+                    push!(t; "; the conversation takes about ", self.ctx_tokens, " now");
+                }
+                push!(t; ". ", COMPACT_HELP);
+                self.say(Style::Info, t);
+            }
+            (b"/compact", b"off") => self.compact_setting(b"off"),
+            (b"/compact", arg) if arg.starts_with(b"at ") || arg.starts_with(b"at\t") => self.compact_setting(text::trim(&arg[3..])),
+            (b"/compact", focus) => self.compact_command(focus),
             (b"/exit" | b"/quit", b"") => {
                 self.emit(Action::Done { status: 0 });
                 self.done = true;
@@ -1048,13 +1305,14 @@ impl Agent {
                     return;
                 }
                 if !self.tr.msgs.is_empty() && !self.cfg.session.is_empty() {
-                    self.clears += 1; // the old conversation stays in its file
+                    self.parts += 1; // the old conversation stays in its file
                 }
                 self.tr.msgs.clear();
                 self.notes.clear();
                 self.seen.clear();
                 self.resume_note.clear();
                 self.turns = 0;
+                self.ctx_tokens = 0;
                 self.say(Style::Info, "Conversation cleared. Background tasks and timers are still running.");
             }
             (b"/verbose", b"") => {
@@ -1070,6 +1328,8 @@ impl Agent {
                  /verbose         show or hide the model's thinking\n\
                  /model [NAME]    show or change the model\n\
                  /effort [LEVEL]  show or set the effort: low, medium, high, xhigh, max, or default\n\
+                 /compact [FOCUS] summarize the conversation to make room (FOCUS: what to keep in view)\n\
+                 /compact at [N]  show or set when that happens by itself (a token count); /compact off\n\
                  /exit            quit (also Ctrl-D)\n\
                  Ctrl-C           stop what is running; twice at the prompt to quit",
             ),
@@ -1100,6 +1360,8 @@ impl Agent {
 
     fn on_interrupt(&mut self) {
         match self.state {
+            State::Compact => self.stop_compact(self.http_id),
+            State::Retry if self.cp.is_some() => self.stop_compact(self.retry_timer),
             State::Model | State::Retry => {
                 let id = if self.state == State::Model { self.http_id } else { self.retry_timer };
                 self.emit(Action::Cancel { id });
@@ -1187,7 +1449,11 @@ impl Agent {
 
     fn on_timer(&mut self, id: i64) {
         if self.state == State::Retry && id == self.retry_timer {
-            self.post_request();
+            if self.cp.is_some() {
+                self.send_compact();
+            } else {
+                self.post_request();
+            }
             return;
         }
         let Some(k) = self.wakes.iter().position(|w| w.id == id) else { return };
